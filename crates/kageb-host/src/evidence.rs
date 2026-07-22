@@ -1181,6 +1181,18 @@ pub fn verify_evidence_file(path: &Path, rpc_url: &str) -> Result<String, String
     {
         return Err(mismatch);
     }
+    let checkpoint_sha256 = hex_digest(Sha256::digest(&checkpoint.artifact));
+    if checkpoint.artifact.len() != bundle.content.checkpoint_artifact_len
+        || checkpoint_sha256 != bundle.content.checkpoint_artifact_sha256
+    {
+        return Err(format!(
+            "canonical checkpoint artifact differs from evidence: expected len {} sha256 {}, observed len {} sha256 {}",
+            bundle.content.checkpoint_artifact_len,
+            bundle.content.checkpoint_artifact_sha256,
+            checkpoint.artifact.len(),
+            checkpoint_sha256
+        ));
+    }
     verify_devnet_evidence_at_rpc(&bundle, &checkpoint.artifact, rpc_url)
         .map_err(|error| format!("verify finalized devnet evidence: {error:?}"))?;
     Ok(format!(
