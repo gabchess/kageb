@@ -22,6 +22,8 @@ const AUTHORIZATION_VERSION: u8 = 1;
 const SIGNED_INTENT_LEN: usize = 192;
 pub const FUNDED_AUTHORIZATION_V1_LEN: usize = 249;
 pub const ENCRYPTED_INTENT_V1_LEN: usize = 344;
+pub const ENCRYPTED_SUBMISSION_V1_LEN: usize =
+    FUNDED_AUTHORIZATION_V1_LEN + ENCRYPTED_INTENT_V1_LEN + 32 + 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CryptoError {
@@ -50,12 +52,12 @@ impl From<ProtocolError> for CryptoError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionPolicyV1 {
-    epoch_id: [u8; 32],
-    operator_key: [u8; 32],
-    minimum: usize,
-    base_atoms: u64,
-    quote_atoms: u64,
-    current_slot: u64,
+    pub(crate) epoch_id: [u8; 32],
+    pub(crate) operator_key: [u8; 32],
+    pub(crate) minimum: usize,
+    pub(crate) base_atoms: u64,
+    pub(crate) quote_atoms: u64,
+    pub(crate) current_slot: u64,
 }
 
 impl AdmissionPolicyV1 {
@@ -86,16 +88,16 @@ impl AdmissionPolicyV1 {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct FundedAuthorizationV1 {
-    version: u8,
-    operator_key: [u8; 32],
-    epoch_id: [u8; 32],
-    participant_id: [u8; 32],
-    trading_key: [u8; 32],
-    nonce: [u8; 32],
-    base_atoms: u64,
-    quote_atoms: u64,
-    expiry_slot: u64,
-    operator_signature: [u8; 64],
+    pub(crate) version: u8,
+    pub(crate) operator_key: [u8; 32],
+    pub(crate) epoch_id: [u8; 32],
+    pub(crate) participant_id: [u8; 32],
+    pub(crate) trading_key: [u8; 32],
+    pub(crate) nonce: [u8; 32],
+    pub(crate) base_atoms: u64,
+    pub(crate) quote_atoms: u64,
+    pub(crate) expiry_slot: u64,
+    pub(crate) operator_signature: [u8; 64],
 }
 
 impl fmt::Debug for FundedAuthorizationV1 {
@@ -537,10 +539,10 @@ fn codec() -> impl Options {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedSubmissionV1 {
-    authorization: FundedAuthorizationV1,
-    ciphertext: Vec<u8>,
-    receipt: [u8; 32],
-    outer_signature: [u8; 64],
+    pub(crate) authorization: FundedAuthorizationV1,
+    pub(crate) ciphertext: Vec<u8>,
+    pub(crate) receipt: [u8; 32],
+    pub(crate) outer_signature: [u8; 64],
 }
 
 impl fmt::Debug for EncryptedSubmissionV1 {
@@ -618,6 +620,43 @@ impl EncryptedSubmissionV1 {
         trading_key
             .verify(&message, &Signature::from_bytes(&self.outer_signature))
             .map_err(|_| CryptoError::InvalidOuterSignature)
+    }
+
+    pub(crate) fn commitment_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(FUNDED_AUTHORIZATION_V1_LEN + 32 + 32 + 64);
+        bytes.extend_from_slice(&self.authorization.encode());
+        bytes.extend_from_slice(&Sha256::digest(&self.ciphertext));
+        bytes.extend_from_slice(&self.receipt);
+        bytes.extend_from_slice(&self.outer_signature);
+        bytes
+    }
+
+    pub(crate) fn encode_wire(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(ENCRYPTED_SUBMISSION_V1_LEN);
+        bytes.extend_from_slice(&self.authorization.encode());
+        bytes.extend_from_slice(&self.ciphertext);
+        bytes.extend_from_slice(&self.receipt);
+        bytes.extend_from_slice(&self.outer_signature);
+        bytes
+    }
+
+    pub(crate) fn decode_wire(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.len() != ENCRYPTED_SUBMISSION_V1_LEN {
+            return Err(CryptoError::InvalidCiphertext);
+        }
+        let authorization = FundedAuthorizationV1::decode(&bytes[..FUNDED_AUTHORIZATION_V1_LEN])?;
+        let ciphertext_end = FUNDED_AUTHORIZATION_V1_LEN + ENCRYPTED_INTENT_V1_LEN;
+        let receipt_end = ciphertext_end + 32;
+        Ok(Self::from_wire_parts(
+            authorization,
+            bytes[FUNDED_AUTHORIZATION_V1_LEN..ciphertext_end].to_vec(),
+            bytes[ciphertext_end..receipt_end]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidReceipt)?,
+            bytes[receipt_end..]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidOuterSignature)?,
+        ))
     }
 }
 

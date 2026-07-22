@@ -9,12 +9,18 @@ fn main() -> ExitCode {
                 Err(_) => ExitCode::FAILURE,
             }
         }
+        [group, command] if group == "keyper" && command == "sign-lock" => {
+            match kageb::handle_keyper_sign_lock() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("sign-lock request rejected: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         [group, command]
             if group == "keyper"
-                && matches!(
-                    command.as_str(),
-                    "sign-lock" | "release-share" | "sign-settlement"
-                ) =>
+                && matches!(command.as_str(), "release-share" | "sign-settlement") =>
         {
             eprintln!("unsupported until a confirmed onchain lock exists");
             ExitCode::from(3)

@@ -42,8 +42,8 @@ fn one_shot_keyper_receives_one_share_only_through_stdin() {
 }
 
 #[test]
-fn premature_keyper_operations_are_explicitly_unsupported() {
-    for operation in ["sign-lock", "release-share", "sign-settlement"] {
+fn post_lock_keyper_operations_are_explicitly_unsupported() {
+    for operation in ["release-share", "sign-settlement"] {
         let output = Command::new(env!("CARGO_BIN_EXE_kageb"))
             .args(["keyper", operation])
             .output()
@@ -71,4 +71,28 @@ fn keyper_rejects_input_larger_than_the_fixed_request() {
         .write_all(&[0; 74])
         .expect("bounded input");
     assert!(!child.wait().expect("wait").success());
+}
+
+#[test]
+fn sign_lock_rejects_input_over_the_protocol_limit() {
+    let directory = tempdir().expect("tempdir");
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private permissions");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kageb"))
+        .args(["keyper", "sign-lock"])
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn keyper");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(&vec![0; 64 * 1024 + 1])
+        .expect("bounded input");
+    assert!(!child.wait().expect("wait").success());
+    assert_eq!(fs::read_dir(directory.path()).expect("read dir").count(), 0);
 }

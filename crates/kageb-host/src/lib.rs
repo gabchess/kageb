@@ -7,6 +7,7 @@ mod demo;
 mod domain;
 mod keyper;
 mod ledger;
+mod lock;
 mod observer;
 
 pub use admission::{
@@ -24,8 +25,13 @@ pub use domain::{IntentBodyV1, ProtocolError, Side};
 pub use keyper::{
     handle_keyper_self_test, run_keyper_self_test, KeyperProcessError, KeyperSelfTestResponse,
 };
+pub use keyper::{handle_keyper_sign_lock, run_keyper_sign_lock};
 pub use ledger::{
     net_batch, BatchConfig, BatchResult, FundedOrder, LedgerError, PoolBalance, Residual,
     VaultDelta,
+};
+pub use lock::{
+    BalanceRecordV1, ConfirmedLock, ConfirmedOpenEpoch, LockApprovalV1, LockJournal, LockPackageV1,
+    LockValidationError, ProgramClient, ReferenceKeyper, SignedBalanceSnapshotV1,
 };
 pub use observer::{DirectOrder, PublicTrace};

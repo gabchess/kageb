@@ -7,16 +7,25 @@ use std::{
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
+use solana_program::pubkey::Pubkey;
 use threshold_crypto::{
     serde_impl::SerdeSecret, PublicKeyShare, SecretKeyShare, SignatureShare, PK_SIZE, SIG_SIZE,
 };
 use zeroize::Zeroizing;
 
-use crate::KeyperSecretShare;
+use crate::{
+    KeyperSecretShare, LockApprovalV1, LockJournal, LockPackageV1, ProgramClient, ReferenceKeyper,
+};
+use ed25519_dalek::SigningKey;
 
 const REQUEST_VERSION: u8 = 1;
 const REQUEST_LEN: usize = 73;
 const RESPONSE_LEN: usize = 1 + 8 + PK_SIZE + SIG_SIZE;
+const SIGN_LOCK_PREFIX_LEN: usize = 13;
+const SIGN_LOCK_RESPONSE_LEN: usize = 129;
+const MAX_SIGN_LOCK_REQUEST_LEN: usize = 64 * 1024;
+const KEYPER_RPC_CONFIG: &str = "keyper-rpc-url";
+const KEYPER_ATTESTATION_KEY: &str = "keyper-attestation-key";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyperProcessError {
@@ -138,6 +147,84 @@ pub fn run_keyper_self_test(
     Ok(response)
 }
 
+pub fn run_keyper_sign_lock(
+    executable: impl AsRef<Path>,
+    private_directory: impl AsRef<Path>,
+    index: usize,
+    expected_keyper: Pubkey,
+    package: &LockPackageV1,
+) -> Result<LockApprovalV1, KeyperProcessError> {
+    verify_private_directory(private_directory.as_ref())?;
+    let expected_digest = package.lock_payload().digest();
+    let package = package
+        .encode_wire()
+        .map_err(|_| KeyperProcessError::Input)?;
+    let package_len = u32::try_from(package.len()).map_err(|_| KeyperProcessError::Input)?;
+    let index = u64::try_from(index).map_err(|_| KeyperProcessError::Input)?;
+    let mut encoded = Zeroizing::new(Vec::with_capacity(SIGN_LOCK_PREFIX_LEN + package.len()));
+    encoded.push(REQUEST_VERSION);
+    encoded.extend_from_slice(&index.to_le_bytes());
+    encoded.extend_from_slice(&package_len.to_le_bytes());
+    encoded.extend_from_slice(&package);
+    if encoded.len() > MAX_SIGN_LOCK_REQUEST_LEN {
+        return Err(KeyperProcessError::Input);
+    }
+    let mut child = Command::new(executable.as_ref())
+        .args(["keyper", "sign-lock"])
+        .env_clear()
+        .current_dir(private_directory.as_ref())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| KeyperProcessError::Spawn)?;
+    let mut stdin = child.stdin.take().ok_or(KeyperProcessError::Spawn)?;
+    stdin
+        .write_all(&encoded)
+        .and_then(|()| stdin.flush())
+        .map_err(|_| KeyperProcessError::Input)?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|_| KeyperProcessError::ChildFailed)?;
+    if !output.status.success() {
+        return Err(KeyperProcessError::ChildFailed);
+    }
+    if !output.stderr.is_empty() || output.stdout.len() != SIGN_LOCK_RESPONSE_LEN {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    let approval = LockApprovalV1::from_parts(
+        output.stdout[1..33]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidResponse)?,
+        output.stdout[33..65]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidResponse)?,
+        output.stdout[65..129]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidResponse)?,
+    );
+    if output.stdout[0] != REQUEST_VERSION {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    validate_lock_approval(expected_keyper, expected_digest, &approval)?;
+    Ok(approval)
+}
+
+fn validate_lock_approval(
+    expected_keyper: Pubkey,
+    expected_digest: [u8; 32],
+    approval: &LockApprovalV1,
+) -> Result<(), KeyperProcessError> {
+    if approval.keyper_key() != expected_keyper.to_bytes()
+        || approval.digest() != expected_digest
+        || !approval.verify()
+    {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn handle_keyper_self_test() -> Result<(), KeyperProcessError> {
     let mut encoded = Zeroizing::new(Vec::with_capacity(REQUEST_LEN + 1));
@@ -164,6 +251,65 @@ pub fn handle_keyper_self_test() -> Result<(), KeyperProcessError> {
     };
     io::stdout()
         .write_all(&encode_response(&response))
+        .and_then(|()| io::stdout().flush())
+        .map_err(|_| KeyperProcessError::InvalidResponse)
+}
+
+#[doc(hidden)]
+pub fn handle_keyper_sign_lock() -> Result<(), KeyperProcessError> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(MAX_SIGN_LOCK_REQUEST_LEN + 1));
+    io::stdin()
+        .take((MAX_SIGN_LOCK_REQUEST_LEN + 1) as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if encoded.len() < SIGN_LOCK_PREFIX_LEN || encoded.len() > MAX_SIGN_LOCK_REQUEST_LEN {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    if encoded[0] != REQUEST_VERSION {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let index = usize::try_from(u64::from_le_bytes(
+        encoded[1..9]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    ))
+    .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let package_len = u32::from_le_bytes(
+        encoded[9..13]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    ) as usize;
+    if SIGN_LOCK_PREFIX_LEN
+        .checked_add(package_len)
+        .ok_or(KeyperProcessError::InvalidRequest)?
+        != encoded.len()
+    {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let package = LockPackageV1::decode_wire(&encoded[SIGN_LOCK_PREFIX_LEN..])
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let signing_seed = read_keyper_attestation_key()?;
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let rpc_url = read_keyper_rpc_url().map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let confirmed = ProgramClient::new(rpc_url)
+        .fetch_confirmed_open_epoch(package.epoch_account())
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let journal_path = std::env::current_dir()
+        .map_err(|_| KeyperProcessError::InvalidRequest)?
+        .join("keyper-locks.bin");
+    let journal =
+        LockJournal::open(journal_path).map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let mut keyper = ReferenceKeyper::new(index, signing_key, journal);
+    let approval = keyper
+        .sign_lock(&package, &confirmed)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let mut response = [0_u8; SIGN_LOCK_RESPONSE_LEN];
+    response[0] = REQUEST_VERSION;
+    response[1..33].copy_from_slice(&approval.keyper_key());
+    response[33..65].copy_from_slice(&approval.digest());
+    response[65..129].copy_from_slice(&approval.signature());
+    io::stdout()
+        .write_all(&response)
         .and_then(|()| io::stdout().flush())
         .map_err(|_| KeyperProcessError::InvalidResponse)
 }
@@ -226,9 +372,76 @@ fn verify_private_directory(path: &Path) -> Result<(), KeyperProcessError> {
     Ok(())
 }
 
+fn read_keyper_rpc_url() -> Result<String, KeyperProcessError> {
+    let path = Path::new(KEYPER_RPC_CONFIG);
+    let metadata = fs::symlink_metadata(path).map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(KeyperProcessError::InvalidRequest);
+        }
+    }
+    let url = fs::read_to_string(path).map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let url = url.trim();
+    if url.is_empty() || url.len() > 2_048 || url.chars().any(char::is_whitespace) {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    Ok(url.to_owned())
+}
+
+fn read_keyper_attestation_key() -> Result<Zeroizing<[u8; 32]>, KeyperProcessError> {
+    let path = Path::new(KEYPER_ATTESTATION_KEY);
+    let metadata = fs::symlink_metadata(path).map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 32 {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(KeyperProcessError::InvalidRequest);
+        }
+    }
+    let bytes = Zeroizing::new(fs::read(path).map_err(|_| KeyperProcessError::InvalidRequest)?);
+    let seed =
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| KeyperProcessError::InvalidRequest)?;
+    Ok(Zeroizing::new(seed))
+}
+
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
         .with_limit(REQUEST_LEN as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn parent_rejects_a_valid_keyper_signature_over_the_wrong_lock_digest() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let expected_digest = [8; 32];
+        let wrong_digest = [9; 32];
+        let approval = LockApprovalV1::from_parts(
+            signing_key.verifying_key().to_bytes(),
+            wrong_digest,
+            signing_key.sign(&wrong_digest).to_bytes(),
+        );
+
+        assert_eq!(
+            validate_lock_approval(
+                Pubkey::new_from_array(signing_key.verifying_key().to_bytes()),
+                expected_digest,
+                &approval,
+            ),
+            Err(KeyperProcessError::InvalidResponse)
+        );
+    }
 }
