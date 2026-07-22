@@ -66,6 +66,12 @@ enum DevnetDeploymentAction {
     Upgrade,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeployedCheckpointDiscovery {
+    upgrade_authority: Option<Pubkey>,
+    artifact_matches: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DevnetPeakRents {
     setup: u64,
@@ -76,8 +82,7 @@ struct DevnetPeakRents {
 }
 
 fn select_deployment_action(
-    deployed: Option<&crate::ExtractedUpgradeableProgramV1>,
-    artifact: &[u8],
+    deployed: Option<&DeployedCheckpointDiscovery>,
     payer: Pubkey,
     initial_program_key: Option<Pubkey>,
 ) -> Result<DevnetDeploymentAction, String> {
@@ -87,7 +92,7 @@ fn select_deployment_action(
         }
         return Ok(DevnetDeploymentAction::Initial);
     };
-    if deployed.executable == artifact {
+    if deployed.artifact_matches {
         return Ok(DevnetDeploymentAction::Noop);
     }
     if deployed.upgrade_authority != Some(payer) {
@@ -125,8 +130,20 @@ fn checked_devnet_deadlines(now: i64, current_slot: u64) -> Result<(i64, i64, u6
 }
 
 fn publish_bytes_noclobber(out: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let parent = out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|_| "create evidence directory failed".to_owned())?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).map_err(|_| "inspect evidence directory failed".to_owned())?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("evidence directory must be a real directory".to_owned());
+    }
+    #[cfg(unix)]
+    if parent_metadata.permissions().mode() & 0o022 != 0 {
+        return Err("evidence directory must not be group or world writable".to_owned());
+    }
     let mut pending = tempfile::NamedTempFile::new_in(parent)
         .map_err(|_| "create pending evidence failed".to_owned())?;
     pending
@@ -839,7 +856,7 @@ pub fn devnet_proof(
     }
     let programdata_address =
         Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
-    let deployed_before = fetch_deployed_checkpoint(&rpc, artifact.len())?;
+    let deployed_before = fetch_deployed_checkpoint_discovery(&rpc, &artifact)?;
     let payer = read_keypair_file(payer_path).map_err(|_| "read devnet payer failed".to_owned())?;
     let initial_program_key = if deployed_before.is_none() {
         Some(resolve_external_program_keypair()?)
@@ -848,7 +865,6 @@ pub fn devnet_proof(
     };
     let deployment_action = select_deployment_action(
         deployed_before.as_ref(),
-        &artifact,
         payer.pubkey(),
         initial_program_key.as_ref().map(Signer::pubkey),
     )?;
@@ -1426,10 +1442,86 @@ fn command_stdout(command: &mut Command) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "repository command returned non-UTF-8".to_owned())
 }
 
+fn discover_deployed_checkpoint(
+    program: &PublicAccountSnapshotV1,
+    expected_programdata: Pubkey,
+    programdata: &PublicAccountSnapshotV1,
+    artifact: &[u8],
+) -> Result<DeployedCheckpointDiscovery, String> {
+    if program.owner != UPGRADEABLE_LOADER_ID || !program.executable {
+        return Err("fixed program is not an upgradeable loader program".to_owned());
+    }
+    let program_state: UpgradeableLoaderState = bincode::deserialize(&program.data)
+        .map_err(|_| "fixed program loader metadata is malformed".to_owned())?;
+    let UpgradeableLoaderState::Program {
+        programdata_address,
+    } = program_state
+    else {
+        return Err("fixed program loader metadata is malformed".to_owned());
+    };
+    if programdata_address != expected_programdata {
+        return Err("fixed program points to unexpected ProgramData".to_owned());
+    }
+    if programdata.owner != UPGRADEABLE_LOADER_ID || programdata.executable {
+        return Err("fixed ProgramData account is invalid".to_owned());
+    }
+    let metadata_len = UpgradeableLoaderState::size_of_programdata_metadata();
+    let metadata = programdata
+        .data
+        .get(..metadata_len)
+        .ok_or("fixed ProgramData metadata is malformed")?;
+    let programdata_state: UpgradeableLoaderState = bincode::deserialize(metadata)
+        .map_err(|_| "fixed ProgramData metadata is malformed".to_owned())?;
+    let UpgradeableLoaderState::ProgramData {
+        upgrade_authority_address,
+        ..
+    } = programdata_state
+    else {
+        return Err("fixed ProgramData metadata is malformed".to_owned());
+    };
+    let executable_region = &programdata.data[metadata_len..];
+    if !executable_region.starts_with(b"\x7fELF") {
+        return Err("fixed ProgramData executable is not ELF".to_owned());
+    }
+    let artifact_matches = executable_region.starts_with(artifact)
+        && executable_region[artifact.len()..]
+            .iter()
+            .all(|byte| *byte == 0);
+    Ok(DeployedCheckpointDiscovery {
+        upgrade_authority: upgrade_authority_address,
+        artifact_matches,
+    })
+}
+
 fn fetch_deployed_checkpoint(
     rpc: &RpcClient,
     artifact_len: usize,
 ) -> Result<Option<crate::ExtractedUpgradeableProgramV1>, String> {
+    let Some((program, programdata)) = fetch_deployment_accounts(rpc)? else {
+        return Ok(None);
+    };
+    let programdata_address =
+        Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
+    extract_upgradeable_program(&program, programdata_address, &programdata, artifact_len)
+        .map(Some)
+        .map_err(|error| format!("extract fixed deployment failed: {error:?}"))
+}
+
+fn fetch_deployed_checkpoint_discovery(
+    rpc: &RpcClient,
+    artifact: &[u8],
+) -> Result<Option<DeployedCheckpointDiscovery>, String> {
+    let Some((program, programdata)) = fetch_deployment_accounts(rpc)? else {
+        return Ok(None);
+    };
+    let programdata_address =
+        Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
+    discover_deployed_checkpoint(&program, programdata_address, &programdata, artifact).map(Some)
+}
+
+fn fetch_deployment_accounts(
+    rpc: &RpcClient,
+) -> Result<Option<(PublicAccountSnapshotV1, PublicAccountSnapshotV1)>, String> {
     let programdata_address =
         Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
     let program = rpc
@@ -1445,22 +1537,18 @@ fn fetch_deployed_checkpoint(
         (Some(program), Some(programdata)) => (program, programdata),
         _ => return Err("fixed deployment accounts are incomplete".to_owned()),
     };
-    extract_upgradeable_program(
-        &PublicAccountSnapshotV1 {
+    Ok(Some((
+        PublicAccountSnapshotV1 {
             owner: program.owner,
             executable: program.executable,
             data: program.data,
         },
-        programdata_address,
-        &PublicAccountSnapshotV1 {
+        PublicAccountSnapshotV1 {
             owner: programdata.owner,
             executable: programdata.executable,
             data: programdata.data,
         },
-        artifact_len,
-    )
-    .map(Some)
-    .map_err(|error| format!("extract fixed deployment failed: {error:?}"))
+    )))
 }
 
 fn resolve_external_program_keypair() -> Result<Keypair, String> {
@@ -1565,38 +1653,112 @@ fn deploy_checkpoint(
     private_directory: &Path,
     artifact: &[u8],
 ) -> Result<(), String> {
+    let solana = resolve_on_path("solana")?;
+    deploy_checkpoint_with_runner(
+        &solana,
+        rpc_url,
+        payer,
+        initial_program_key,
+        action,
+        private_directory,
+        artifact,
+        |command| {
+            command
+                .output()
+                .map(|output| output.status.success())
+                .map_err(|_| ())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deploy_checkpoint_with_runner<F>(
+    solana: &Path,
+    rpc_url: &str,
+    payer: &Keypair,
+    initial_program_key: Option<&Keypair>,
+    action: DevnetDeploymentAction,
+    private_directory: &Path,
+    artifact: &[u8],
+    mut runner: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut Command) -> Result<bool, ()>,
+{
     let artifact_path = private_directory.join("checkpoint.so");
-    let payer_path = private_directory.join("deploy-payer.json");
     write_private_file(&artifact_path, artifact)?;
+    let signer_directory = tempfile::Builder::new()
+        .prefix("deploy-signers-")
+        .tempdir_in(private_directory)
+        .map_err(|_| "create private deploy signer directory failed".to_owned())?;
+    #[cfg(unix)]
+    fs::set_permissions(signer_directory.path(), fs::Permissions::from_mode(0o700))
+        .map_err(|_| "secure private deploy signer directory failed".to_owned())?;
+    let payer_path = signer_directory.path().join("payer.json");
+    let buffer_path = signer_directory.path().join("buffer.json");
+    let buffer = Keypair::new();
+    let buffer_pubkey = buffer.pubkey();
     write_private_keypair(&payer_path, payer)?;
+    write_private_keypair(&buffer_path, &buffer)?;
     let program_id = if action == DevnetDeploymentAction::Initial {
         let keypair = initial_program_key.ok_or("initial program key is missing")?;
-        let program_path = private_directory.join("deploy-program.json");
+        let program_path = signer_directory.path().join("program.json");
         write_private_keypair(&program_path, keypair)?;
         program_path.into_os_string()
     } else {
         ID.to_string().into()
     };
-    let solana = resolve_on_path("solana")?;
-    let output = Command::new(solana)
-        .args(["program", "deploy"])
-        .arg(&artifact_path)
-        .args(["--url", rpc_url, "--commitment", "finalized", "--use-rpc"])
-        .arg("--fee-payer")
-        .arg(&payer_path)
-        .arg("--keypair")
-        .arg(&payer_path)
-        .arg("--upgrade-authority")
-        .arg(&payer_path)
-        .arg("--program-id")
-        .arg(program_id)
-        .args(["--output", "json"])
-        .output()
-        .map_err(|_| "launch Solana program deploy failed".to_owned())?;
-    if !output.status.success() {
-        return Err("Solana program deploy failed".to_owned());
+    let deploy_status = {
+        let mut command = Command::new(solana);
+        command
+            .args(["program", "deploy"])
+            .arg(&artifact_path)
+            .args(["--url", rpc_url, "--commitment", "finalized", "--use-rpc"])
+            .arg("--fee-payer")
+            .arg(&payer_path)
+            .arg("--keypair")
+            .arg(&payer_path)
+            .arg("--upgrade-authority")
+            .arg(&payer_path)
+            .arg("--program-id")
+            .arg(program_id)
+            .arg("--buffer")
+            .arg(&buffer_path)
+            .arg("--max-len")
+            .arg(artifact.len().to_string())
+            .args(["--output", "json"]);
+        runner(&mut command)
+    };
+    let buffer_cleanup_failed = if deploy_status == Ok(false) {
+        let mut command = Command::new(solana);
+        command
+            .args(["program", "close"])
+            .arg(buffer_pubkey.to_string())
+            .arg("--buffers")
+            .args(["--url", rpc_url, "--commitment", "finalized"])
+            .arg("--keypair")
+            .arg(&payer_path)
+            .arg("--authority")
+            .arg(&payer_path)
+            .arg("--recipient")
+            .arg(payer.pubkey().to_string())
+            .args(["--output", "json"]);
+        runner(&mut command) != Ok(true)
+    } else {
+        false
+    };
+    let signer_cleanup = signer_directory.close();
+    if buffer_cleanup_failed {
+        return Err(format!(
+            "Solana program deploy failed; buffer cleanup failed: {buffer_pubkey}"
+        ));
     }
-    Ok(())
+    signer_cleanup.map_err(|_| "remove private deploy signer files failed".to_owned())?;
+    match deploy_status {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("Solana program deploy failed".to_owned()),
+        Err(()) => Err("launch Solana program deploy failed".to_owned()),
+    }
 }
 
 fn private_runtime_root() -> Result<PathBuf, String> {
@@ -2835,50 +2997,128 @@ fn token_amount(rpc: &RpcClient, address: &Pubkey) -> Result<u64, String> {
 mod devnet_tests {
     use super::*;
 
-    fn deployed(
-        executable: &[u8],
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn argument_after(command: &Command, flag: &str) -> String {
+        let arguments = command_args(command);
+        let position = arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .unwrap();
+        arguments[position + 1].clone()
+    }
+
+    fn program_account(programdata: Pubkey) -> PublicAccountSnapshotV1 {
+        let mut data = 2_u32.to_le_bytes().to_vec();
+        data.extend_from_slice(programdata.as_ref());
+        PublicAccountSnapshotV1 {
+            owner: UPGRADEABLE_LOADER_ID,
+            executable: true,
+            data,
+        }
+    }
+
+    fn programdata_account(
+        slot: u64,
         authority: Option<Pubkey>,
-    ) -> crate::ExtractedUpgradeableProgramV1 {
-        crate::ExtractedUpgradeableProgramV1 {
-            deployment_slot: 10,
+        executable: &[u8],
+        padding: &[u8],
+    ) -> PublicAccountSnapshotV1 {
+        let mut data = 3_u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&slot.to_le_bytes());
+        match authority {
+            Some(authority) => {
+                data.push(1);
+                data.extend_from_slice(authority.as_ref());
+            }
+            None => data.push(0),
+        }
+        data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
+        data.extend_from_slice(executable);
+        data.extend_from_slice(padding);
+        PublicAccountSnapshotV1 {
+            owner: UPGRADEABLE_LOADER_ID,
+            executable: false,
+            data,
+        }
+    }
+
+    fn deployed(artifact_matches: bool, authority: Option<Pubkey>) -> DeployedCheckpointDiscovery {
+        DeployedCheckpointDiscovery {
             upgrade_authority: authority,
-            executable: executable.to_vec(),
-            executable_sha256: hex_sha256(executable),
+            artifact_matches,
         }
     }
 
     #[test]
     fn deployment_action_is_noop_initial_or_authorized_upgrade() {
         let payer = Pubkey::new_unique();
-        let artifact = b"\x7fELFcheckpoint";
         assert_eq!(
-            select_deployment_action(None, artifact, payer, Some(ID)).unwrap(),
+            select_deployment_action(None, payer, Some(ID)).unwrap(),
             DevnetDeploymentAction::Initial
         );
         assert_eq!(
-            select_deployment_action(Some(&deployed(artifact, None)), artifact, payer, None)
-                .unwrap(),
+            select_deployment_action(Some(&deployed(true, None)), payer, None).unwrap(),
             DevnetDeploymentAction::Noop
         );
         assert_eq!(
-            select_deployment_action(
-                Some(&deployed(b"\x7fELFold", Some(payer))),
-                artifact,
-                payer,
-                None,
-            )
-            .unwrap(),
+            select_deployment_action(Some(&deployed(false, Some(payer))), payer, None).unwrap(),
             DevnetDeploymentAction::Upgrade
         );
         assert!(select_deployment_action(
-            Some(&deployed(b"\x7fELFold", Some(Pubkey::new_unique()))),
-            artifact,
+            Some(&deployed(false, Some(Pubkey::new_unique()))),
             payer,
             None,
         )
         .is_err());
-        assert!(
-            select_deployment_action(None, artifact, payer, Some(Pubkey::new_unique())).is_err()
+        assert!(select_deployment_action(None, payer, Some(Pubkey::new_unique())).is_err());
+    }
+
+    #[test]
+    fn deployment_discovery_accepts_a_shorter_valid_elf_as_an_authorized_mismatch() {
+        let programdata = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let artifact = b"\x7fELFnew-checkpoint-is-longer";
+        let program = program_account(programdata);
+        let account = programdata_account(10, Some(payer), b"\x7fELFold", &[0; 32]);
+
+        let discovered =
+            discover_deployed_checkpoint(&program, programdata, &account, artifact).unwrap();
+
+        assert_eq!(discovered.upgrade_authority, Some(payer));
+        assert!(!discovered.artifact_matches);
+        assert_eq!(
+            select_deployment_action(Some(&discovered), payer, None).unwrap(),
+            DevnetDeploymentAction::Upgrade
+        );
+    }
+
+    #[test]
+    fn deployment_discovery_accepts_a_longer_valid_elf_as_an_authorized_mismatch() {
+        let programdata = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let artifact = b"\x7fELFnew";
+        let program = program_account(programdata);
+        let account = programdata_account(
+            10,
+            Some(payer),
+            b"\x7fELFold-checkpoint-is-longer",
+            &[0; 32],
+        );
+
+        let discovered =
+            discover_deployed_checkpoint(&program, programdata, &account, artifact).unwrap();
+
+        assert_eq!(discovered.upgrade_authority, Some(payer));
+        assert!(!discovered.artifact_matches);
+        assert_eq!(
+            select_deployment_action(Some(&discovered), payer, None).unwrap(),
+            DevnetDeploymentAction::Upgrade
         );
     }
 
@@ -2910,6 +3150,142 @@ mod devnet_tests {
         assert!(checked_devnet_deadlines(i64::MAX, u64::MAX).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deploy_uses_an_exact_max_len_named_buffer_and_ephemeral_private_signers() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let payer = Keypair::new();
+        let program = Keypair::new();
+        let artifact = b"\x7fELFcheckpoint";
+        let mut signer_paths = Vec::new();
+
+        deploy_checkpoint_with_runner(
+            Path::new("/fake/solana"),
+            "https://api.devnet.solana.com",
+            &payer,
+            Some(&program),
+            DevnetDeploymentAction::Initial,
+            directory.path(),
+            artifact,
+            |command: &mut Command| {
+                assert_eq!(command.get_program(), "/fake/solana");
+                assert_eq!(
+                    argument_after(command, "--max-len"),
+                    artifact.len().to_string()
+                );
+                for flag in ["--fee-payer", "--program-id", "--buffer"] {
+                    let path = PathBuf::from(argument_after(command, flag));
+                    assert!(path.exists());
+                    assert_eq!(
+                        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                    assert_eq!(
+                        fs::metadata(path.parent().unwrap())
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o700
+                    );
+                    signer_paths.push(path);
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(signer_paths.len(), 3);
+        assert!(signer_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_deploy_attempts_named_buffer_refund_before_removing_signers() {
+        let directory = tempfile::tempdir().unwrap();
+        let payer = Keypair::new();
+        let artifact = b"\x7fELFcheckpoint";
+        let mut buffer = None;
+        let mut signer_paths = Vec::new();
+        let mut invocation = 0;
+
+        let result = deploy_checkpoint_with_runner(
+            Path::new("/fake/solana"),
+            "https://api.devnet.solana.com",
+            &payer,
+            None,
+            DevnetDeploymentAction::Upgrade,
+            directory.path(),
+            artifact,
+            |command: &mut Command| {
+                invocation += 1;
+                if invocation == 1 {
+                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
+                    signer_paths.extend([payer_path, buffer_path]);
+                    return Ok(false);
+                }
+                let arguments = command_args(command);
+                assert_eq!(
+                    &arguments[..3],
+                    ["program", "close", &buffer.unwrap().to_string()]
+                );
+                assert!(arguments.iter().any(|argument| argument == "--buffers"));
+                assert_eq!(
+                    argument_after(command, "--recipient"),
+                    payer.pubkey().to_string()
+                );
+                for path in &signer_paths {
+                    assert!(path.exists());
+                }
+                Ok(true)
+            },
+        );
+
+        assert_eq!(result, Err("Solana program deploy failed".to_owned()));
+        assert_eq!(invocation, 2);
+        assert!(signer_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_buffer_refund_reports_only_the_recoverable_public_buffer_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let payer = Keypair::new();
+        let artifact = b"\x7fELFcheckpoint";
+        let mut buffer = None;
+        let mut invocation = 0;
+
+        let error = deploy_checkpoint_with_runner(
+            Path::new("/fake/solana"),
+            "https://api.devnet.solana.com",
+            &payer,
+            None,
+            DevnetDeploymentAction::Upgrade,
+            directory.path(),
+            artifact,
+            |command: &mut Command| {
+                invocation += 1;
+                if invocation == 1 {
+                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
+                }
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!(
+                "Solana program deploy failed; buffer cleanup failed: {}",
+                buffer.unwrap()
+            )
+        );
+    }
+
     #[test]
     fn evidence_publication_never_clobbers_an_existing_path() {
         let directory = tempfile::tempdir().unwrap();
@@ -2918,6 +3294,35 @@ mod devnet_tests {
 
         assert!(publish_bytes_noclobber(&output, b"loser").is_err());
         assert_eq!(fs::read(&output).unwrap(), b"winner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_publication_rejects_a_symlinked_output_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_parent = directory.path().join("real");
+        let linked_parent = directory.path().join("linked");
+        fs::create_dir(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let output = linked_parent.join("proof.json");
+
+        assert!(publish_bytes_noclobber(&output, b"proof").is_err());
+        assert!(!real_parent.join("proof.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_publication_rejects_a_group_or_world_writable_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let output = parent.join("proof.json");
+
+        assert!(publish_bytes_noclobber(&output, b"proof").is_err());
+        assert!(!output.exists());
     }
 
     #[test]
