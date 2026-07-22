@@ -2932,6 +2932,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-ed25519-program",
  "solana-keypair",
+ "solana-loader-v3-interface",
  "solana-message 3.1.0",
  "solana-program",
  "solana-rpc-client",

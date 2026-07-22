@@ -1,17 +1,1353 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use kageb_program::wire::SettlementPayloadV1;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use solana_loader_v3_interface::state::UpgradeableLoaderState;
+use solana_program::{instruction::Instruction, program_pack::Pack, pubkey::Pubkey};
+use solana_rpc_client::{api::config::RpcTransactionConfig, rpc_client::RpcClient};
+use solana_transaction_status_client_types::{
+    option_serializer::OptionSerializer, EncodedConfirmedTransactionWithStatusMeta, UiInstruction,
+    UiTransactionEncoding, UiTransactionTokenBalance,
+};
 
 use crate::{
-    content_root, BatchConfig, ConfirmedLock, FundedOrder, LockPackageV1, PoolBalance,
-    ReferenceKeyper, ReleasedShareV1, Residual, SignedIntentV1, MAX_BATCH_MEMBERS,
+    content_root, BatchConfig, ConfirmedLock, FundedOrder, KagebObserverAccounts, LockPackageV1,
+    PoolBalance, PublicTrace, ReferenceKeyper, ReleasedShareV1, Residual, SignedIntentV1,
+    MAX_BATCH_MEMBERS,
 };
 
 const RESULT_COMMITMENT_DOMAIN: &[u8] = b"KAGEB_RESULT_COMMITMENT_V1\0";
 const RECOVERED_INTENTS_DOMAIN: &[u8] = b"KAGEB_RECOVERED_INTENTS_V1\0";
 const MAX_RELEASED_SHARE_WIRE_LEN: usize = 512;
+const EVIDENCE_BUNDLE_DOMAIN: &[u8] = b"KAGEB_EVIDENCE_BUNDLE_V1\0";
+
+pub const UPGRADEABLE_LOADER_ID: Pubkey =
+    solana_program::pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevnetEvidenceBundleV1 {
+    pub schema_version: u8,
+    pub content: DevnetEvidenceContentV1,
+    pub evidence_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevnetEvidenceContentV1 {
+    pub cluster: String,
+    pub public_commit: String,
+    pub checkpoint_artifact_len: usize,
+    pub checkpoint_artifact_sha256: String,
+    pub deployment: EvidenceDeploymentV1,
+    pub transactions: EvidenceTransactionsV1,
+    pub accounts: EvidenceAccountsV1,
+    pub configuration: EvidenceConfigurationV1,
+    pub commitments: EvidenceCommitmentsV1,
+    pub token_balances: EvidenceTokenBalancesV1,
+    pub decoded_allowlist: Vec<DecodedInstructionEvidenceV1>,
+    pub explorer_links: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceDeploymentV1 {
+    pub program: String,
+    pub loader: String,
+    pub programdata: String,
+    pub deployment_slot: u64,
+    pub upgrade_authority: Option<String>,
+    pub deployed_executable_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceTransactionV1 {
+    pub signature: String,
+    pub slot: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingTransactionEvidenceV1 {
+    pub authority: String,
+    pub transaction: EvidenceTransactionV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceTransactionsV1 {
+    pub funding: [FundingTransactionEvidenceV1; 4],
+    pub lock: EvidenceTransactionV1,
+    pub settlement: EvidenceTransactionV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceAccountsV1 {
+    pub fee_payer: String,
+    pub operator: String,
+    pub pool: String,
+    pub epoch: String,
+    pub vault_authority: String,
+    pub base_mint: String,
+    pub quote_mint: String,
+    pub pool_base_vault: String,
+    pub pool_quote_vault: String,
+    pub venue_authority: String,
+    pub venue_base_account: String,
+    pub venue_quote_account: String,
+    pub token_program: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceConfigurationV1 {
+    pub epoch_id: String,
+    pub minimum_count: u32,
+    pub member_count: u32,
+    pub lock_threshold: u8,
+    pub settlement_threshold: u8,
+    pub keypers: [String; 3],
+    pub base_lot_atoms: u64,
+    pub quote_atoms_per_lot: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceCommitmentsV1 {
+    pub configuration_hash: String,
+    pub pre_balance_root: String,
+    pub member_set: String,
+    pub lock_digest: String,
+    pub result: String,
+    pub settlement_digest: String,
+    pub local_transcript_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceTokenBalancesV1 {
+    pub pool_base_before: u64,
+    pub pool_base_after: u64,
+    pub pool_quote_before: u64,
+    pub pool_quote_after: u64,
+    pub venue_base_before: u64,
+    pub venue_base_after: u64,
+    pub venue_quote_before: u64,
+    pub venue_quote_after: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodedInstructionEvidenceV1 {
+    pub transaction: String,
+    pub position: u16,
+    pub program: String,
+    pub kind: String,
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DevnetEvidenceError {
+    InvalidSchema,
+    ContentHashMismatch,
+    WrongLoader,
+    WrongProgramDataOwner,
+    WrongProgramDataAddress,
+    MalformedLoaderMetadata,
+    TruncatedExecutable,
+    InvalidElf,
+    NonZeroProgramDataTail,
+    InvalidPublicField,
+    WrongCluster,
+    WrongProgram,
+    DeploymentMismatch,
+    MissingTransaction,
+    UnfinalizedTransaction,
+    FailedTransaction,
+    TransactionSlotMismatch,
+    RepeatedFundingAuthority,
+    WrongAccountOwner,
+    WrongState,
+    WrongMemberCount,
+    WrongKeyper,
+    ChangedCommitment,
+    WrongTokenDelta,
+    UnexpectedInstruction,
+    SecondSettlement,
+    WrongGenesis,
+    RpcUnavailable,
+    InvalidTransaction,
+    InvalidTokenAccount,
+}
+
+impl DevnetEvidenceBundleV1 {
+    pub fn seal(content: DevnetEvidenceContentV1) -> Result<Self, DevnetEvidenceError> {
+        let evidence_sha256 = evidence_content_hash(&content)?;
+        Ok(Self {
+            schema_version: 1,
+            content,
+            evidence_sha256,
+        })
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, DevnetEvidenceError> {
+        serde_json::from_str(json).map_err(|_| DevnetEvidenceError::InvalidSchema)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, DevnetEvidenceError> {
+        serde_json::to_string_pretty(self).map_err(|_| DevnetEvidenceError::InvalidSchema)
+    }
+
+    pub fn verify_content_hash(&self) -> Result<(), DevnetEvidenceError> {
+        if self.schema_version != 1 || evidence_content_hash(&self.content)? != self.evidence_sha256
+        {
+            return Err(DevnetEvidenceError::ContentHashMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn evidence_content_hash(content: &DevnetEvidenceContentV1) -> Result<String, DevnetEvidenceError> {
+    let encoded = serde_json::to_vec(content).map_err(|_| DevnetEvidenceError::InvalidSchema)?;
+    let mut hasher = Sha256::new();
+    hasher.update(EVIDENCE_BUNDLE_DOMAIN);
+    hasher.update(encoded);
+    Ok(hex_digest(hasher.finalize()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicAccountSnapshotV1 {
+    pub owner: Pubkey,
+    pub executable: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractedUpgradeableProgramV1 {
+    pub deployment_slot: u64,
+    pub upgrade_authority: Option<Pubkey>,
+    pub executable: Vec<u8>,
+    pub executable_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedTransactionSnapshotV1 {
+    pub signature: String,
+    pub slot: u64,
+    pub finalized: bool,
+    pub succeeded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevnetPublicSnapshotV1 {
+    pub program: PublicAccountSnapshotV1,
+    pub programdata_address: Pubkey,
+    pub programdata: PublicAccountSnapshotV1,
+    pub pool: PublicAccountSnapshotV1,
+    pub epoch: PublicAccountSnapshotV1,
+    pub base_mint: PublicAccountSnapshotV1,
+    pub quote_mint: PublicAccountSnapshotV1,
+    pub transactions: Vec<FinalizedTransactionSnapshotV1>,
+    pub token_balances: EvidenceTokenBalancesV1,
+    pub decoded_allowlist: Vec<DecodedInstructionEvidenceV1>,
+}
+
+pub fn extract_upgradeable_program(
+    program: &PublicAccountSnapshotV1,
+    expected_programdata: Pubkey,
+    programdata: &PublicAccountSnapshotV1,
+    checkpoint_artifact_len: usize,
+) -> Result<ExtractedUpgradeableProgramV1, DevnetEvidenceError> {
+    if program.owner != UPGRADEABLE_LOADER_ID || !program.executable {
+        return Err(DevnetEvidenceError::WrongLoader);
+    }
+    let program_state: UpgradeableLoaderState = bincode::deserialize(&program.data)
+        .map_err(|_| DevnetEvidenceError::MalformedLoaderMetadata)?;
+    let UpgradeableLoaderState::Program {
+        programdata_address,
+    } = program_state
+    else {
+        return Err(DevnetEvidenceError::MalformedLoaderMetadata);
+    };
+    if programdata_address.to_bytes() != expected_programdata.to_bytes() {
+        return Err(DevnetEvidenceError::WrongProgramDataAddress);
+    }
+    if programdata.owner != UPGRADEABLE_LOADER_ID || programdata.executable {
+        return Err(DevnetEvidenceError::WrongProgramDataOwner);
+    }
+    let metadata_len = UpgradeableLoaderState::size_of_programdata_metadata();
+    let metadata = programdata
+        .data
+        .get(..metadata_len)
+        .ok_or(DevnetEvidenceError::MalformedLoaderMetadata)?;
+    let programdata_state: UpgradeableLoaderState =
+        bincode::deserialize(metadata).map_err(|_| DevnetEvidenceError::MalformedLoaderMetadata)?;
+    let UpgradeableLoaderState::ProgramData {
+        slot,
+        upgrade_authority_address,
+    } = programdata_state
+    else {
+        return Err(DevnetEvidenceError::MalformedLoaderMetadata);
+    };
+    let executable_end = metadata_len
+        .checked_add(checkpoint_artifact_len)
+        .ok_or(DevnetEvidenceError::TruncatedExecutable)?;
+    let executable = programdata
+        .data
+        .get(metadata_len..executable_end)
+        .ok_or(DevnetEvidenceError::TruncatedExecutable)?;
+    if !executable.starts_with(b"\x7fELF") {
+        return Err(DevnetEvidenceError::InvalidElf);
+    }
+    if programdata.data[executable_end..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(DevnetEvidenceError::NonZeroProgramDataTail);
+    }
+    Ok(ExtractedUpgradeableProgramV1 {
+        deployment_slot: slot,
+        upgrade_authority: upgrade_authority_address
+            .map(|address| Pubkey::new_from_array(address.to_bytes())),
+        executable: executable.to_vec(),
+        executable_sha256: hex_digest(Sha256::digest(executable)),
+    })
+}
+
+pub fn verify_devnet_evidence(
+    bundle: &DevnetEvidenceBundleV1,
+    snapshot: &DevnetPublicSnapshotV1,
+    checkpoint_artifact: &[u8],
+) -> Result<(), DevnetEvidenceError> {
+    bundle.verify_content_hash()?;
+    let evidence = &bundle.content;
+    validate_public_fields(evidence, checkpoint_artifact)?;
+    validate_deployment(evidence, snapshot, checkpoint_artifact)?;
+    validate_transactions(evidence, &snapshot.transactions)?;
+    validate_distinct_funding_authorities(evidence)?;
+    let (pool, epoch) = validate_program_state(evidence, snapshot)?;
+    validate_token_deltas(evidence, snapshot, &epoch)?;
+    validate_allowlist(evidence, snapshot, pool.settlement_threshold)?;
+    Ok(())
+}
+
+fn validate_public_fields(
+    evidence: &DevnetEvidenceContentV1,
+    checkpoint_artifact: &[u8],
+) -> Result<(), DevnetEvidenceError> {
+    if evidence.cluster != "devnet" {
+        return Err(DevnetEvidenceError::WrongCluster);
+    }
+    if evidence.public_commit.len() != 40
+        || !evidence
+            .public_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || evidence.checkpoint_artifact_len != checkpoint_artifact.len()
+        || parse_digest(&evidence.checkpoint_artifact_sha256)?
+            != Sha256::digest(checkpoint_artifact).as_slice()
+    {
+        return Err(DevnetEvidenceError::InvalidPublicField);
+    }
+    if parse_pubkey(&evidence.deployment.program)? != kageb_program::ID
+        || parse_pubkey(&evidence.accounts.token_program)? != kageb_program::TOKEN_PROGRAM_ID
+    {
+        return Err(DevnetEvidenceError::WrongProgram);
+    }
+    if parse_pubkey(&evidence.deployment.loader)? != UPGRADEABLE_LOADER_ID {
+        return Err(DevnetEvidenceError::WrongLoader);
+    }
+    let transactions = evidence
+        .transactions
+        .funding
+        .iter()
+        .map(|funding| &funding.transaction)
+        .chain([
+            &evidence.transactions.lock,
+            &evidence.transactions.settlement,
+        ]);
+    if evidence.explorer_links.len() != 6
+        || !evidence
+            .explorer_links
+            .iter()
+            .zip(transactions)
+            .all(|(link, transaction)| {
+                link == &format!(
+                    "https://explorer.solana.com/tx/{}?cluster=devnet",
+                    transaction.signature
+                )
+            })
+    {
+        return Err(DevnetEvidenceError::InvalidPublicField);
+    }
+    Ok(())
+}
+
+fn validate_deployment(
+    evidence: &DevnetEvidenceContentV1,
+    snapshot: &DevnetPublicSnapshotV1,
+    checkpoint_artifact: &[u8],
+) -> Result<(), DevnetEvidenceError> {
+    let programdata = parse_pubkey(&evidence.deployment.programdata)?;
+    if programdata != snapshot.programdata_address {
+        return Err(DevnetEvidenceError::WrongProgramDataAddress);
+    }
+    let extracted = extract_upgradeable_program(
+        &snapshot.program,
+        programdata,
+        &snapshot.programdata,
+        evidence.checkpoint_artifact_len,
+    )?;
+    let upgrade_authority = evidence
+        .deployment
+        .upgrade_authority
+        .as_deref()
+        .map(parse_pubkey)
+        .transpose()?;
+    if extracted.deployment_slot != evidence.deployment.deployment_slot
+        || extracted.upgrade_authority != upgrade_authority
+        || extracted.executable.as_slice() != checkpoint_artifact
+        || extracted.executable_sha256 != evidence.deployment.deployed_executable_sha256
+        || extracted.executable_sha256 != evidence.checkpoint_artifact_sha256
+    {
+        return Err(DevnetEvidenceError::DeploymentMismatch);
+    }
+    Ok(())
+}
+
+fn validate_transactions(
+    evidence: &DevnetEvidenceContentV1,
+    snapshots: &[FinalizedTransactionSnapshotV1],
+) -> Result<(), DevnetEvidenceError> {
+    let expected = evidence
+        .transactions
+        .funding
+        .iter()
+        .map(|funding| &funding.transaction)
+        .chain([
+            &evidence.transactions.lock,
+            &evidence.transactions.settlement,
+        ]);
+    let mut signatures = BTreeSet::new();
+    for transaction in expected {
+        solana_signature::Signature::from_str(&transaction.signature)
+            .map_err(|_| DevnetEvidenceError::InvalidPublicField)?;
+        if !signatures.insert(transaction.signature.as_str()) {
+            return Err(DevnetEvidenceError::UnexpectedInstruction);
+        }
+        let fetched = snapshots
+            .iter()
+            .find(|snapshot| snapshot.signature == transaction.signature)
+            .ok_or(DevnetEvidenceError::MissingTransaction)?;
+        if !fetched.finalized {
+            return Err(DevnetEvidenceError::UnfinalizedTransaction);
+        }
+        if !fetched.succeeded {
+            return Err(DevnetEvidenceError::FailedTransaction);
+        }
+        if fetched.slot != transaction.slot {
+            return Err(DevnetEvidenceError::TransactionSlotMismatch);
+        }
+    }
+    if snapshots.len() != signatures.len() {
+        return Err(DevnetEvidenceError::UnexpectedInstruction);
+    }
+    Ok(())
+}
+
+fn validate_distinct_funding_authorities(
+    evidence: &DevnetEvidenceContentV1,
+) -> Result<(), DevnetEvidenceError> {
+    let mut authorities = BTreeSet::new();
+    for funding in &evidence.transactions.funding {
+        let authority = parse_pubkey(&funding.authority)?;
+        if authority == Pubkey::default() || !authorities.insert(authority) {
+            return Err(DevnetEvidenceError::RepeatedFundingAuthority);
+        }
+    }
+    Ok(())
+}
+
+fn validate_program_state(
+    evidence: &DevnetEvidenceContentV1,
+    snapshot: &DevnetPublicSnapshotV1,
+) -> Result<
+    (
+        kageb_program::state::PoolStateV1,
+        kageb_program::state::EpochStateV1,
+    ),
+    DevnetEvidenceError,
+> {
+    if snapshot.pool.owner != kageb_program::ID
+        || snapshot.pool.executable
+        || snapshot.epoch.owner != kageb_program::ID
+        || snapshot.epoch.executable
+    {
+        return Err(DevnetEvidenceError::WrongAccountOwner);
+    }
+    let pool = kageb_program::state::PoolStateV1::decode(&snapshot.pool.data)
+        .map_err(|_| DevnetEvidenceError::WrongState)?;
+    let epoch = kageb_program::state::EpochStateV1::decode(&snapshot.epoch.data)
+        .map_err(|_| DevnetEvidenceError::WrongState)?;
+    let operator = parse_pubkey(&evidence.accounts.operator)?;
+    let base_mint = parse_pubkey(&evidence.accounts.base_mint)?;
+    let quote_mint = parse_pubkey(&evidence.accounts.quote_mint)?;
+    let expected_pool = parse_pubkey(&evidence.accounts.pool)?;
+    let expected_epoch = parse_pubkey(&evidence.accounts.epoch)?;
+    let expected_vault_authority = parse_pubkey(&evidence.accounts.vault_authority)?;
+    let (derived_pool, pool_bump) = kageb_program::pool_address(&operator, &base_mint, &quote_mint);
+    let (derived_vault_authority, vault_bump) =
+        kageb_program::vault_authority_address(&derived_pool);
+    let epoch_id = parse_digest(&evidence.configuration.epoch_id)?;
+    let (derived_epoch, epoch_bump) = kageb_program::epoch_address(&derived_pool, &epoch_id);
+    if expected_pool != derived_pool
+        || expected_epoch != derived_epoch
+        || expected_vault_authority != derived_vault_authority
+        || pool.pool_bump != pool_bump
+        || pool.vault_bump != vault_bump
+        || epoch.epoch_bump != epoch_bump
+        || pool.operator != operator
+        || pool.base_mint != base_mint
+        || pool.quote_mint != quote_mint
+        || pool.pool_base_vault != parse_pubkey(&evidence.accounts.pool_base_vault)?
+        || pool.pool_quote_vault != parse_pubkey(&evidence.accounts.pool_quote_vault)?
+        || pool.venue_authority != parse_pubkey(&evidence.accounts.venue_authority)?
+        || pool.venue_base_account != parse_pubkey(&evidence.accounts.venue_base_account)?
+        || pool.venue_quote_account != parse_pubkey(&evidence.accounts.venue_quote_account)?
+        || epoch.pool != expected_pool
+        || epoch.epoch_id != epoch_id
+        || epoch.terminal_state != kageb_program::state::EpochTerminalState::Settled
+        || epoch.settlement_nonce == [0; 32]
+        || epoch.lock_nonce == [0; 32]
+    {
+        return Err(DevnetEvidenceError::WrongState);
+    }
+    if evidence.configuration.member_count != 4
+        || evidence.configuration.minimum_count != 4
+        || epoch.member_count != evidence.configuration.member_count
+        || epoch.minimum_count != evidence.configuration.minimum_count
+        || epoch.member_count < epoch.minimum_count
+    {
+        return Err(DevnetEvidenceError::WrongMemberCount);
+    }
+    let mut keypers = [Pubkey::default(); 3];
+    for (slot, encoded) in keypers.iter_mut().zip(&evidence.configuration.keypers) {
+        *slot = parse_pubkey(encoded)?;
+    }
+    if keypers != pool.keypers
+        || keypers.iter().collect::<BTreeSet<_>>().len() != keypers.len()
+        || evidence.configuration.lock_threshold != pool.lock_threshold
+        || evidence.configuration.settlement_threshold != pool.settlement_threshold
+        || pool.lock_threshold != 2
+        || pool.settlement_threshold != 2
+    {
+        return Err(DevnetEvidenceError::WrongKeyper);
+    }
+    if evidence.configuration.base_lot_atoms != pool.base_lot_atoms
+        || evidence.configuration.base_lot_atoms != epoch.base_lot_atoms
+        || evidence.configuration.quote_atoms_per_lot != epoch.quote_atoms_per_lot
+    {
+        return Err(DevnetEvidenceError::WrongState);
+    }
+    if epoch.configuration_hash != parse_digest(&evidence.commitments.configuration_hash)?
+        || epoch.pre_balance_root != parse_digest(&evidence.commitments.pre_balance_root)?
+        || epoch.member_root != parse_digest(&evidence.commitments.member_set)?
+        || epoch.lock_digest != parse_digest(&evidence.commitments.lock_digest)?
+        || epoch.result_commitment != parse_digest(&evidence.commitments.result)?
+        || epoch.settlement_digest != parse_digest(&evidence.commitments.settlement_digest)?
+    {
+        return Err(DevnetEvidenceError::ChangedCommitment);
+    }
+    parse_digest(&evidence.commitments.local_transcript_sha256)?;
+    Ok((pool, epoch))
+}
+
+fn validate_token_deltas(
+    evidence: &DevnetEvidenceContentV1,
+    snapshot: &DevnetPublicSnapshotV1,
+    epoch: &kageb_program::state::EpochStateV1,
+) -> Result<(), DevnetEvidenceError> {
+    validate_public_mint(&snapshot.base_mint)?;
+    validate_public_mint(&snapshot.quote_mint)?;
+    let balances = &evidence.token_balances;
+    let base_before = balances
+        .pool_base_before
+        .checked_add(balances.venue_base_before)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    let base_after = balances
+        .pool_base_after
+        .checked_add(balances.venue_base_after)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    let quote_before = balances
+        .pool_quote_before
+        .checked_add(balances.venue_quote_before)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    let quote_after = balances
+        .pool_quote_after
+        .checked_add(balances.venue_quote_after)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    if balances != &snapshot.token_balances
+        || base_before != base_after
+        || quote_before != quote_after
+    {
+        return Err(DevnetEvidenceError::WrongTokenDelta);
+    }
+    let lots = u64::from(epoch.residual_lots);
+    let base = epoch
+        .base_lot_atoms
+        .checked_mul(lots)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    let quote = epoch
+        .quote_atoms_per_lot
+        .checked_mul(lots)
+        .ok_or(DevnetEvidenceError::WrongTokenDelta)?;
+    let deltas = (
+        i128::from(balances.pool_base_after) - i128::from(balances.pool_base_before),
+        i128::from(balances.pool_quote_after) - i128::from(balances.pool_quote_before),
+        i128::from(balances.venue_base_after) - i128::from(balances.venue_base_before),
+        i128::from(balances.venue_quote_after) - i128::from(balances.venue_quote_before),
+    );
+    let expected = match (epoch.residual_side, epoch.residual_lots) {
+        (0, 0) => (0, 0, 0, 0),
+        (1, 1..=u32::MAX) => (
+            i128::from(base),
+            -i128::from(quote),
+            -i128::from(base),
+            i128::from(quote),
+        ),
+        (2, 1..=u32::MAX) => (
+            -i128::from(base),
+            i128::from(quote),
+            i128::from(base),
+            -i128::from(quote),
+        ),
+        _ => return Err(DevnetEvidenceError::WrongTokenDelta),
+    };
+    if deltas != expected {
+        return Err(DevnetEvidenceError::WrongTokenDelta);
+    }
+    Ok(())
+}
+
+fn validate_public_mint(mint: &PublicAccountSnapshotV1) -> Result<(), DevnetEvidenceError> {
+    if mint.owner != kageb_program::TOKEN_PROGRAM_ID || mint.executable {
+        return Err(DevnetEvidenceError::InvalidTokenAccount);
+    }
+    let mint = spl_token_interface::state::Mint::unpack(&mint.data)
+        .map_err(|_| DevnetEvidenceError::InvalidTokenAccount)?;
+    if mint.decimals != 0 || mint.mint_authority.is_some() || mint.freeze_authority.is_some() {
+        return Err(DevnetEvidenceError::InvalidTokenAccount);
+    }
+    Ok(())
+}
+
+fn validate_allowlist(
+    evidence: &DevnetEvidenceContentV1,
+    snapshot: &DevnetPublicSnapshotV1,
+    settlement_threshold: u8,
+) -> Result<(), DevnetEvidenceError> {
+    let aggregate_count = snapshot
+        .decoded_allowlist
+        .iter()
+        .filter(|instruction| instruction.kind == "aggregate-settlement")
+        .count();
+    if aggregate_count > 1 {
+        return Err(DevnetEvidenceError::SecondSettlement);
+    }
+    if aggregate_count != 1 {
+        return Err(DevnetEvidenceError::UnexpectedInstruction);
+    }
+    let lock_approvals = snapshot
+        .decoded_allowlist
+        .iter()
+        .filter(|instruction| instruction.kind == "keyper-lock-approval")
+        .count();
+    let settlement_approvals = snapshot
+        .decoded_allowlist
+        .iter()
+        .filter(|instruction| instruction.kind == "keyper-settlement-approval")
+        .count();
+    if lock_approvals != usize::from(evidence.configuration.lock_threshold)
+        || settlement_approvals != usize::from(settlement_threshold)
+        || snapshot.decoded_allowlist != evidence.decoded_allowlist
+    {
+        return Err(DevnetEvidenceError::UnexpectedInstruction);
+    }
+    for instruction in &snapshot.decoded_allowlist {
+        let expected_digest = match instruction.kind.as_str() {
+            "keyper-lock-approval" | "epoch-lock" => Some(&evidence.commitments.lock_digest),
+            "keyper-settlement-approval" | "aggregate-settlement" => {
+                Some(&evidence.commitments.settlement_digest)
+            }
+            "pool-funding-base"
+            | "pool-funding-quote"
+            | "aggregate-base-leg"
+            | "aggregate-quote-leg" => None,
+            _ => return Err(DevnetEvidenceError::UnexpectedInstruction),
+        };
+        if instruction.digest.as_ref() != expected_digest {
+            return Err(DevnetEvidenceError::UnexpectedInstruction);
+        }
+        if let Some(digest) = &instruction.digest {
+            parse_digest(digest)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_pubkey(encoded: &str) -> Result<Pubkey, DevnetEvidenceError> {
+    Pubkey::from_str(encoded).map_err(|_| DevnetEvidenceError::InvalidPublicField)
+}
+
+fn parse_digest(encoded: &str) -> Result<[u8; 32], DevnetEvidenceError> {
+    if encoded.len() != 64 {
+        return Err(DevnetEvidenceError::InvalidPublicField);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| DevnetEvidenceError::InvalidPublicField)?;
+    }
+    Ok(decoded)
+}
+
+pub fn fetch_devnet_public_snapshot(
+    bundle: &DevnetEvidenceBundleV1,
+    rpc_url: &str,
+) -> Result<DevnetPublicSnapshotV1, DevnetEvidenceError> {
+    bundle.verify_content_hash()?;
+    let rpc = RpcClient::new_with_commitment(
+        rpc_url.to_owned(),
+        solana_commitment_config::CommitmentConfig::finalized(),
+    );
+    if rpc
+        .get_genesis_hash()
+        .map_err(|_| DevnetEvidenceError::RpcUnavailable)?
+        .to_string()
+        != DEVNET_GENESIS_HASH
+    {
+        return Err(DevnetEvidenceError::WrongGenesis);
+    }
+    let evidence = &bundle.content;
+    let program_address = parse_pubkey(&evidence.deployment.program)?;
+    let programdata_address = parse_pubkey(&evidence.deployment.programdata)?;
+    let pool_address = parse_pubkey(&evidence.accounts.pool)?;
+    let epoch_address = parse_pubkey(&evidence.accounts.epoch)?;
+    let base_mint_address = parse_pubkey(&evidence.accounts.base_mint)?;
+    let quote_mint_address = parse_pubkey(&evidence.accounts.quote_mint)?;
+    let program = fetch_finalized_account(&rpc, program_address)?;
+    let programdata = fetch_finalized_account(&rpc, programdata_address)?;
+    let pool = fetch_finalized_account(&rpc, pool_address)?;
+    let epoch = fetch_finalized_account(&rpc, epoch_address)?;
+    let base_mint = fetch_finalized_account(&rpc, base_mint_address)?;
+    let quote_mint = fetch_finalized_account(&rpc, quote_mint_address)?;
+
+    let expected_transactions: Vec<&EvidenceTransactionV1> = evidence
+        .transactions
+        .funding
+        .iter()
+        .map(|funding| &funding.transaction)
+        .chain([
+            &evidence.transactions.lock,
+            &evidence.transactions.settlement,
+        ])
+        .collect();
+    let signatures: Vec<_> = expected_transactions
+        .iter()
+        .map(|transaction| {
+            solana_signature::Signature::from_str(&transaction.signature)
+                .map_err(|_| DevnetEvidenceError::InvalidPublicField)
+        })
+        .collect::<Result<_, _>>()?;
+    let statuses = rpc
+        .get_signature_statuses_with_history(&signatures)
+        .map_err(|_| DevnetEvidenceError::RpcUnavailable)?
+        .value;
+    let mut transaction_snapshots = Vec::with_capacity(signatures.len());
+    let mut fetched_transactions = Vec::with_capacity(signatures.len());
+    for ((expected, signature), status) in
+        expected_transactions.iter().zip(&signatures).zip(statuses)
+    {
+        let status = status.ok_or(DevnetEvidenceError::MissingTransaction)?;
+        let finalized =
+            status.satisfies_commitment(solana_commitment_config::CommitmentConfig::finalized());
+        let succeeded = status.err.is_none() && status.status.is_ok();
+        let fetched = rpc
+            .get_transaction_with_config(
+                signature,
+                RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    commitment: Some(solana_commitment_config::CommitmentConfig::finalized()),
+                    max_supported_transaction_version: Some(0),
+                },
+            )
+            .map_err(|_| DevnetEvidenceError::MissingTransaction)?;
+        transaction_snapshots.push(FinalizedTransactionSnapshotV1 {
+            signature: expected.signature.clone(),
+            slot: fetched.slot,
+            finalized,
+            succeeded,
+        });
+        fetched_transactions.push(fetched);
+    }
+
+    let mut decoded_allowlist = Vec::new();
+    for (index, (funding, transaction)) in evidence
+        .transactions
+        .funding
+        .iter()
+        .zip(&fetched_transactions[..4])
+        .enumerate()
+    {
+        decoded_allowlist.extend(decode_funding_transaction(
+            transaction,
+            index,
+            funding,
+            evidence,
+        )?);
+    }
+    let lock = &fetched_transactions[4];
+    let settlement = &fetched_transactions[5];
+    let observer_accounts = observer_accounts(evidence)?;
+    PublicTrace::from_confirmed_kageb(lock, settlement, observer_accounts)
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+    decoded_allowlist.extend(decode_kageb_transaction(lock, "lock", evidence)?);
+    decoded_allowlist.extend(decode_kageb_transaction(
+        settlement,
+        "settlement",
+        evidence,
+    )?);
+    let token_balances = transaction_token_balances(settlement, evidence)?;
+    validate_live_token_accounts(&rpc, evidence, &token_balances)?;
+    Ok(DevnetPublicSnapshotV1 {
+        program,
+        programdata_address,
+        programdata,
+        pool,
+        epoch,
+        base_mint,
+        quote_mint,
+        transactions: transaction_snapshots,
+        token_balances,
+        decoded_allowlist,
+    })
+}
+
+pub fn verify_devnet_evidence_at_rpc(
+    bundle: &DevnetEvidenceBundleV1,
+    checkpoint_artifact: &[u8],
+    rpc_url: &str,
+) -> Result<(), DevnetEvidenceError> {
+    let snapshot = fetch_devnet_public_snapshot(bundle, rpc_url)?;
+    verify_devnet_evidence(bundle, &snapshot, checkpoint_artifact)
+}
+
+pub fn verify_evidence_file(path: &std::path::Path, rpc_url: &str) -> Result<String, String> {
+    const MAX_EVIDENCE_BYTES: u64 = 65_536;
+
+    let size = std::fs::metadata(path)
+        .map_err(|error| format!("read evidence metadata {}: {error}", path.display()))?
+        .len();
+    if size > MAX_EVIDENCE_BYTES {
+        return Err(format!("evidence exceeds {MAX_EVIDENCE_BYTES} bytes"));
+    }
+    let json = std::fs::read_to_string(path)
+        .map_err(|error| format!("read evidence {}: {error}", path.display()))?;
+    let bundle = DevnetEvidenceBundleV1::from_json(&json)
+        .map_err(|error| format!("parse evidence: {error:?}"))?;
+    bundle
+        .verify_content_hash()
+        .map_err(|error| format!("verify evidence content address: {error:?}"))?;
+    let artifact = std::env::var_os("KAGEB_CHECKPOINT_ARTIFACT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/deploy/kageb_program.so")
+        });
+    let bytes = std::fs::read(&artifact)
+        .map_err(|error| format!("read checkpoint artifact {}: {error}", artifact.display()))?;
+    verify_devnet_evidence_at_rpc(&bundle, &bytes, rpc_url)
+        .map_err(|error| format!("verify finalized devnet evidence: {error:?}"))?;
+    Ok(format!(
+        "VERIFIED: finalized devnet aggregate settlement {}\n",
+        bundle.content.transactions.settlement.signature
+    ))
+}
+
+fn fetch_finalized_account(
+    rpc: &RpcClient,
+    address: Pubkey,
+) -> Result<PublicAccountSnapshotV1, DevnetEvidenceError> {
+    let account = rpc
+        .get_account_with_commitment(
+            &address,
+            solana_commitment_config::CommitmentConfig::finalized(),
+        )
+        .map_err(|_| DevnetEvidenceError::RpcUnavailable)?
+        .value
+        .ok_or(DevnetEvidenceError::RpcUnavailable)?;
+    Ok(PublicAccountSnapshotV1 {
+        owner: account.owner,
+        executable: account.executable,
+        data: account.data,
+    })
+}
+
+fn observer_accounts(
+    evidence: &DevnetEvidenceContentV1,
+) -> Result<KagebObserverAccounts, DevnetEvidenceError> {
+    Ok(KagebObserverAccounts {
+        fee_payer: parse_pubkey(&evidence.accounts.fee_payer)?,
+        payer: parse_pubkey(&evidence.accounts.operator)?,
+        pool: parse_pubkey(&evidence.accounts.pool)?,
+        epoch: parse_pubkey(&evidence.accounts.epoch)?,
+        vault_authority: parse_pubkey(&evidence.accounts.vault_authority)?,
+        pool_base_vault: parse_pubkey(&evidence.accounts.pool_base_vault)?,
+        pool_quote_vault: parse_pubkey(&evidence.accounts.pool_quote_vault)?,
+        venue_authority: parse_pubkey(&evidence.accounts.venue_authority)?,
+        venue_base_account: parse_pubkey(&evidence.accounts.venue_base_account)?,
+        venue_quote_account: parse_pubkey(&evidence.accounts.venue_quote_account)?,
+        base_mint: parse_pubkey(&evidence.accounts.base_mint)?,
+        quote_mint: parse_pubkey(&evidence.accounts.quote_mint)?,
+        base_lot_atoms: evidence.configuration.base_lot_atoms,
+        quote_atoms_per_lot: evidence.configuration.quote_atoms_per_lot,
+    })
+}
+
+fn decode_funding_transaction(
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    funding_index: usize,
+    funding: &FundingTransactionEvidenceV1,
+    evidence: &DevnetEvidenceContentV1,
+) -> Result<Vec<DecodedInstructionEvidenceV1>, DevnetEvidenceError> {
+    let meta = confirmed
+        .transaction
+        .meta
+        .as_ref()
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    if meta.err.is_some() || meta.status.is_err() {
+        return Err(DevnetEvidenceError::FailedTransaction);
+    }
+    if !matches!(
+        &meta.inner_instructions,
+        OptionSerializer::None | OptionSerializer::Skip
+    ) && !matches!(&meta.inner_instructions, OptionSerializer::Some(inner) if inner.is_empty())
+    {
+        return Err(DevnetEvidenceError::InvalidTransaction);
+    }
+    let transaction = confirmed
+        .transaction
+        .transaction
+        .decode()
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    let keys = transaction.message.static_account_keys();
+    let instructions = transaction.message.instructions();
+    let authority = parse_pubkey(&funding.authority)?;
+    if keys.first() != Some(&parse_pubkey(&evidence.accounts.fee_payer)?)
+        || instructions.len() != 2
+        || !keys
+            .iter()
+            .take(usize::from(
+                transaction.message.header().num_required_signatures,
+            ))
+            .any(|key| *key == authority)
+    {
+        return Err(DevnetEvidenceError::InvalidTransaction);
+    }
+    let expected = [
+        (
+            parse_pubkey(&evidence.accounts.base_mint)?,
+            parse_pubkey(&evidence.accounts.pool_base_vault)?,
+            evidence.configuration.base_lot_atoms,
+            "pool-funding-base",
+        ),
+        (
+            parse_pubkey(&evidence.accounts.quote_mint)?,
+            parse_pubkey(&evidence.accounts.pool_quote_vault)?,
+            evidence.configuration.quote_atoms_per_lot,
+            "pool-funding-quote",
+        ),
+    ];
+    let mut decoded = Vec::with_capacity(2);
+    let mut sources = BTreeSet::new();
+    for (position, (instruction, (mint, destination, amount, kind))) in
+        instructions.iter().zip(expected).enumerate()
+    {
+        if keys.get(instruction.program_id_index as usize) != Some(&kageb_program::TOKEN_PROGRAM_ID)
+            || instruction.accounts.len() != 4
+        {
+            return Err(DevnetEvidenceError::InvalidTransaction);
+        }
+        let accounts: Vec<_> = instruction
+            .accounts
+            .iter()
+            .map(|index| {
+                keys.get(*index as usize)
+                    .copied()
+                    .ok_or(DevnetEvidenceError::InvalidTransaction)
+            })
+            .collect::<Result<_, _>>()?;
+        let token = spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data)
+            .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+        if accounts[1] != mint
+            || accounts[2] != destination
+            || accounts[3] != authority
+            || accounts[0] == destination
+            || !sources.insert(accounts[0])
+            || !matches!(
+                token,
+                spl_token_interface::instruction::TokenInstruction::TransferChecked {
+                    amount: actual,
+                    decimals: 0,
+                } if actual == amount
+            )
+        {
+            return Err(DevnetEvidenceError::InvalidTransaction);
+        }
+        decoded.push(DecodedInstructionEvidenceV1 {
+            transaction: format!("funding-{funding_index}"),
+            position: u16::try_from(position)
+                .map_err(|_| DevnetEvidenceError::InvalidTransaction)?,
+            program: kageb_program::TOKEN_PROGRAM_ID.to_string(),
+            kind: kind.to_owned(),
+            digest: None,
+        });
+    }
+    Ok(decoded)
+}
+
+fn decode_kageb_transaction(
+    confirmed: &EncodedConfirmedTransactionWithStatusMeta,
+    transaction_name: &str,
+    evidence: &DevnetEvidenceContentV1,
+) -> Result<Vec<DecodedInstructionEvidenceV1>, DevnetEvidenceError> {
+    let transaction = confirmed
+        .transaction
+        .transaction
+        .decode()
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    let keys = transaction.message.static_account_keys();
+    let instructions = transaction.message.instructions();
+    let mut decoded = Vec::new();
+    let mut actual_program_digest = None;
+    let mut actual_signers = BTreeSet::new();
+    for (position, instruction) in instructions.iter().enumerate() {
+        let program = keys
+            .get(instruction.program_id_index as usize)
+            .copied()
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+        let (kind, digest) = if program == solana_program::ed25519_program::ID {
+            let parsed = kageb_program::ed25519::parse_strict_ed25519(&Instruction {
+                program_id: program,
+                accounts: Vec::new(),
+                data: instruction.data.clone(),
+            })
+            .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+            if !actual_signers.insert(parsed.signer) {
+                return Err(DevnetEvidenceError::WrongKeyper);
+            }
+            (
+                if transaction_name == "lock" {
+                    "keyper-lock-approval"
+                } else {
+                    "keyper-settlement-approval"
+                },
+                parsed.digest,
+            )
+        } else if program == kageb_program::ID {
+            let (kind, digest) =
+                match kageb_program::instruction::KagebInstruction::decode(&instruction.data)
+                    .map_err(|_| DevnetEvidenceError::InvalidTransaction)?
+                {
+                    kageb_program::instruction::KagebInstruction::Lock(payload)
+                        if transaction_name == "lock" =>
+                    {
+                        ("epoch-lock", payload.digest())
+                    }
+                    kageb_program::instruction::KagebInstruction::Settle(payload)
+                        if transaction_name == "settlement" =>
+                    {
+                        let full = SettlementPayloadV1 {
+                            epoch_account: parse_pubkey(&evidence.accounts.epoch)?,
+                            lock_digest: parse_digest(&evidence.commitments.lock_digest)?,
+                            result_commitment: payload.result_commitment,
+                            residual_side: payload.residual_side,
+                            residual_lots: payload.residual_lots,
+                            base_lot_atoms: evidence.configuration.base_lot_atoms,
+                            quote_atoms_per_lot: evidence.configuration.quote_atoms_per_lot,
+                            base_mint: parse_pubkey(&evidence.accounts.base_mint)?,
+                            quote_mint: parse_pubkey(&evidence.accounts.quote_mint)?,
+                            pool_base_vault: parse_pubkey(&evidence.accounts.pool_base_vault)?,
+                            pool_quote_vault: parse_pubkey(&evidence.accounts.pool_quote_vault)?,
+                            venue_base_account: parse_pubkey(
+                                &evidence.accounts.venue_base_account,
+                            )?,
+                            venue_quote_account: parse_pubkey(
+                                &evidence.accounts.venue_quote_account,
+                            )?,
+                            venue_authority: parse_pubkey(&evidence.accounts.venue_authority)?,
+                            settlement_nonce: payload.settlement_nonce,
+                        };
+                        ("aggregate-settlement", full.digest())
+                    }
+                    _ => return Err(DevnetEvidenceError::InvalidTransaction),
+                };
+            actual_program_digest = Some(digest);
+            (kind, digest)
+        } else {
+            return Err(DevnetEvidenceError::InvalidTransaction);
+        };
+        decoded.push(DecodedInstructionEvidenceV1 {
+            transaction: transaction_name.to_owned(),
+            position: u16::try_from(position)
+                .map_err(|_| DevnetEvidenceError::InvalidTransaction)?,
+            program: program.to_string(),
+            kind: kind.to_owned(),
+            digest: Some(hex_digest(digest)),
+        });
+    }
+    let actual_program_digest =
+        actual_program_digest.ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    if decoded.iter().any(|instruction| {
+        instruction.digest.as_deref() != Some(hex_digest(actual_program_digest).as_str())
+    }) {
+        return Err(DevnetEvidenceError::InvalidTransaction);
+    }
+    let expected_keypers: BTreeSet<_> = evidence
+        .configuration
+        .keypers
+        .iter()
+        .map(|key| parse_pubkey(key))
+        .collect::<Result<_, _>>()?;
+    if !actual_signers.is_subset(&expected_keypers) {
+        return Err(DevnetEvidenceError::WrongKeyper);
+    }
+    if transaction_name == "settlement" {
+        let meta = confirmed
+            .transaction
+            .meta
+            .as_ref()
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+        let inner = match &meta.inner_instructions {
+            OptionSerializer::Some(inner) => inner,
+            OptionSerializer::None | OptionSerializer::Skip => {
+                return Err(DevnetEvidenceError::InvalidTransaction)
+            }
+        };
+        let group = inner
+            .iter()
+            .find(|group| group.index == 2)
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+        for (inner_index, instruction) in group.instructions.iter().enumerate() {
+            let UiInstruction::Compiled(instruction) = instruction else {
+                return Err(DevnetEvidenceError::InvalidTransaction);
+            };
+            if keys.get(instruction.program_id_index as usize)
+                != Some(&kageb_program::TOKEN_PROGRAM_ID)
+                || instruction.accounts.len() != 4
+            {
+                return Err(DevnetEvidenceError::InvalidTransaction);
+            }
+            let mint = keys
+                .get(instruction.accounts[1] as usize)
+                .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+            let kind = if *mint == parse_pubkey(&evidence.accounts.base_mint)? {
+                "aggregate-base-leg"
+            } else if *mint == parse_pubkey(&evidence.accounts.quote_mint)? {
+                "aggregate-quote-leg"
+            } else {
+                return Err(DevnetEvidenceError::InvalidTransaction);
+            };
+            decoded.push(DecodedInstructionEvidenceV1 {
+                transaction: transaction_name.to_owned(),
+                position: u16::try_from(instructions.len() + inner_index)
+                    .map_err(|_| DevnetEvidenceError::InvalidTransaction)?,
+                program: kageb_program::TOKEN_PROGRAM_ID.to_string(),
+                kind: kind.to_owned(),
+                digest: None,
+            });
+        }
+    }
+    Ok(decoded)
+}
+
+fn transaction_token_balances(
+    settlement: &EncodedConfirmedTransactionWithStatusMeta,
+    evidence: &DevnetEvidenceContentV1,
+) -> Result<EvidenceTokenBalancesV1, DevnetEvidenceError> {
+    let meta = settlement
+        .transaction
+        .meta
+        .as_ref()
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    let transaction = settlement
+        .transaction
+        .transaction
+        .decode()
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    let keys = transaction.message.static_account_keys();
+    let pre = token_balance_list(&meta.pre_token_balances)?;
+    let post = token_balance_list(&meta.post_token_balances)?;
+    let amount = |list: &[UiTransactionTokenBalance], address: &str, mint: &str, owner: &str| {
+        token_balance_at(list, keys, address, mint, owner)
+    };
+    Ok(EvidenceTokenBalancesV1 {
+        pool_base_before: amount(
+            pre,
+            &evidence.accounts.pool_base_vault,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.vault_authority,
+        )?,
+        pool_base_after: amount(
+            post,
+            &evidence.accounts.pool_base_vault,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.vault_authority,
+        )?,
+        pool_quote_before: amount(
+            pre,
+            &evidence.accounts.pool_quote_vault,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.vault_authority,
+        )?,
+        pool_quote_after: amount(
+            post,
+            &evidence.accounts.pool_quote_vault,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.vault_authority,
+        )?,
+        venue_base_before: amount(
+            pre,
+            &evidence.accounts.venue_base_account,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.venue_authority,
+        )?,
+        venue_base_after: amount(
+            post,
+            &evidence.accounts.venue_base_account,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.venue_authority,
+        )?,
+        venue_quote_before: amount(
+            pre,
+            &evidence.accounts.venue_quote_account,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.venue_authority,
+        )?,
+        venue_quote_after: amount(
+            post,
+            &evidence.accounts.venue_quote_account,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.venue_authority,
+        )?,
+    })
+}
+
+fn token_balance_list(
+    balances: &OptionSerializer<Vec<UiTransactionTokenBalance>>,
+) -> Result<&[UiTransactionTokenBalance], DevnetEvidenceError> {
+    match balances {
+        OptionSerializer::Some(balances) => Ok(balances),
+        OptionSerializer::None | OptionSerializer::Skip => {
+            Err(DevnetEvidenceError::InvalidTransaction)
+        }
+    }
+}
+
+fn token_balance_at(
+    balances: &[UiTransactionTokenBalance],
+    keys: &[Pubkey],
+    address: &str,
+    mint: &str,
+    owner: &str,
+) -> Result<u64, DevnetEvidenceError> {
+    let address = parse_pubkey(address)?;
+    let balance = balances
+        .iter()
+        .find(|balance| keys.get(balance.account_index as usize) == Some(&address))
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    if balance.mint != mint
+        || balance.ui_token_amount.decimals != 0
+        || !matches!(&balance.owner, OptionSerializer::Some(actual) if actual == owner)
+        || !matches!(
+            &balance.program_id,
+            OptionSerializer::Some(actual) if actual == &kageb_program::TOKEN_PROGRAM_ID.to_string()
+        )
+    {
+        return Err(DevnetEvidenceError::InvalidTransaction);
+    }
+    balance
+        .ui_token_amount
+        .amount
+        .parse()
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)
+}
+
+fn validate_live_token_accounts(
+    rpc: &RpcClient,
+    evidence: &DevnetEvidenceContentV1,
+    balances: &EvidenceTokenBalancesV1,
+) -> Result<(), DevnetEvidenceError> {
+    let accounts = [
+        (
+            &evidence.accounts.pool_base_vault,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.vault_authority,
+            balances.pool_base_after,
+        ),
+        (
+            &evidence.accounts.pool_quote_vault,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.vault_authority,
+            balances.pool_quote_after,
+        ),
+        (
+            &evidence.accounts.venue_base_account,
+            &evidence.accounts.base_mint,
+            &evidence.accounts.venue_authority,
+            balances.venue_base_after,
+        ),
+        (
+            &evidence.accounts.venue_quote_account,
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.venue_authority,
+            balances.venue_quote_after,
+        ),
+    ];
+    for (address, mint, authority, amount) in accounts {
+        let account = fetch_finalized_account(rpc, parse_pubkey(address)?)?;
+        if account.owner != kageb_program::TOKEN_PROGRAM_ID {
+            return Err(DevnetEvidenceError::InvalidTokenAccount);
+        }
+        let token = spl_token_interface::state::Account::unpack(&account.data)
+            .map_err(|_| DevnetEvidenceError::InvalidTokenAccount)?;
+        if token.mint != parse_pubkey(mint)?
+            || token.owner != parse_pubkey(authority)?
+            || token.amount != amount
+        {
+            return Err(DevnetEvidenceError::InvalidTokenAccount);
+        }
+    }
+    Ok(())
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.as_ref().len() * 2);
+    for byte in bytes.as_ref() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    encoded
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct SettlementBalanceV1 {
