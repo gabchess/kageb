@@ -30,8 +30,15 @@ use sha2::{Digest, Sha256};
 use solana_commitment_config::CommitmentConfig;
 use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_keypair::{read_keypair_file, Keypair};
-use solana_loader_v3_interface::state::UpgradeableLoaderState;
-use solana_program::{clock::Clock, instruction::Instruction, program_pack::Pack, pubkey::Pubkey};
+use solana_loader_v3_interface::{
+    instruction::UpgradeableLoaderInstruction, state::UpgradeableLoaderState,
+};
+use solana_program::{
+    clock::Clock,
+    instruction::{AccountMeta, Instruction},
+    program_pack::Pack,
+    pubkey::Pubkey,
+};
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signature::Signature;
 use solana_signer::Signer;
@@ -1665,7 +1672,7 @@ fn deploy_checkpoint(
     artifact: &[u8],
 ) -> Result<(), String> {
     let solana = resolve_on_path("solana")?;
-    deploy_checkpoint_with_runner(
+    deploy_checkpoint_with_runner_and_refunder(
         &solana,
         rpc_url,
         payer,
@@ -1676,14 +1683,77 @@ fn deploy_checkpoint(
         |command| {
             command
                 .output()
-                .map(|output| output.status.success())
+                .map(|output| {
+                    if !output.status.success() {
+                        eprintln!(
+                            "Solana program deploy failed: {}",
+                            classify_deploy_failure(&output.stdout, &output.stderr)
+                        );
+                    }
+                    output.status.success()
+                })
                 .map_err(|_| ())
         },
+        |buffer| close_deploy_buffer(rpc_url, payer, buffer),
     )
 }
 
+fn classify_deploy_failure(stdout: &[u8], stderr: &[u8]) -> &'static str {
+    let stdout = String::from_utf8_lossy(stdout).to_ascii_lowercase();
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let contains = |needle: &str| stdout.contains(needle) || stderr.contains(needle);
+    if contains("insufficient funds") {
+        "insufficient payer funds"
+    } else if contains("max retries")
+        || contains("timed out")
+        || contains("blockhash not found")
+        || contains("node is behind")
+        || contains("429")
+    {
+        "devnet transport retries exhausted"
+    } else if contains("elf error")
+        || contains("verification failed")
+        || contains("program failed to complete")
+    {
+        "program rejected by the cluster"
+    } else {
+        "unclassified CLI failure"
+    }
+}
+
+fn close_deploy_buffer_instruction(
+    buffer: Pubkey,
+    recipient: Pubkey,
+    authority: Pubkey,
+) -> Instruction {
+    Instruction::new_with_bincode(
+        UPGRADEABLE_LOADER_ID,
+        &UpgradeableLoaderInstruction::Close,
+        vec![
+            AccountMeta::new(buffer, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(authority, true),
+        ],
+    )
+}
+
+fn close_deploy_buffer(rpc_url: &str, payer: &Keypair, buffer: Pubkey) -> Result<(), ()> {
+    let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::finalized());
+    let blockhash = rpc.get_latest_blockhash().map_err(|_| ())?;
+    let instruction = close_deploy_buffer_instruction(buffer, payer.pubkey(), payer.pubkey());
+    let transaction = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer.pubkey()),
+        &[payer],
+        blockhash,
+    );
+    rpc.send_and_confirm_transaction(&transaction)
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn deploy_checkpoint_with_runner<F>(
+fn deploy_checkpoint_with_runner_and_refunder<F, R>(
     solana: &Path,
     rpc_url: &str,
     payer: &Keypair,
@@ -1692,9 +1762,11 @@ fn deploy_checkpoint_with_runner<F>(
     private_directory: &Path,
     artifact: &[u8],
     mut runner: F,
+    mut refunder: R,
 ) -> Result<(), String>
 where
     F: FnMut(&mut Command) -> Result<bool, ()>,
+    R: FnMut(Pubkey) -> Result<(), ()>,
 {
     let artifact_path = private_directory.join("checkpoint.so");
     write_private_file(&artifact_path, artifact)?;
@@ -1737,27 +1809,11 @@ where
             .arg(&buffer_path)
             .arg("--max-len")
             .arg(artifact.len().to_string())
+            .args(["--max-sign-attempts", "20"])
             .args(["--output", "json"]);
         runner(&mut command)
     };
-    let buffer_cleanup_failed = if deploy_status != Ok(true) {
-        let mut command = Command::new(solana);
-        command
-            .args(["program", "close"])
-            .arg(buffer_pubkey.to_string())
-            .arg("--buffers")
-            .args(["--url", rpc_url, "--commitment", "finalized"])
-            .arg("--keypair")
-            .arg(&payer_path)
-            .arg("--authority")
-            .arg(&payer_path)
-            .arg("--recipient")
-            .arg(payer.pubkey().to_string())
-            .args(["--output", "json"]);
-        runner(&mut command) != Ok(true)
-    } else {
-        false
-    };
+    let buffer_cleanup_failed = deploy_status != Ok(true) && refunder(buffer_pubkey).is_err();
     let signer_cleanup_failed = signer_directory.close().is_err();
     finish_deploy_attempt(
         deploy_status,
@@ -3190,6 +3246,44 @@ mod devnet_tests {
         assert!(checked_devnet_deadlines(i64::MAX, u64::MAX).is_err());
     }
 
+    #[test]
+    fn deploy_buffer_refund_targets_only_the_named_buffer() {
+        let buffer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let instruction = close_deploy_buffer_instruction(buffer, recipient, authority);
+
+        assert_eq!(instruction.program_id, UPGRADEABLE_LOADER_ID);
+        assert_eq!(
+            instruction.accounts,
+            vec![
+                AccountMeta::new(buffer, false),
+                AccountMeta::new(recipient, false),
+                AccountMeta::new_readonly(authority, true),
+            ]
+        );
+        assert_eq!(
+            bincode::deserialize::<UpgradeableLoaderInstruction>(&instruction.data).unwrap(),
+            UpgradeableLoaderInstruction::Close
+        );
+    }
+
+    #[test]
+    fn deploy_failure_output_is_reduced_to_a_safe_class() {
+        assert_eq!(
+            classify_deploy_failure(b"", b"RPC max retries exceeded at /private/key.json"),
+            "devnet transport retries exhausted"
+        );
+        assert_eq!(
+            classify_deploy_failure(b"Insufficient funds", b""),
+            "insufficient payer funds"
+        );
+        assert_eq!(
+            classify_deploy_failure(b"unknown /private/key.json", b""),
+            "unclassified CLI failure"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn deploy_uses_an_exact_max_len_named_buffer_and_ephemeral_private_signers() {
@@ -3200,7 +3294,7 @@ mod devnet_tests {
         let artifact = b"\x7fELFcheckpoint";
         let mut signer_paths = Vec::new();
 
-        deploy_checkpoint_with_runner(
+        deploy_checkpoint_with_runner_and_refunder(
             Path::new("/fake/solana"),
             "https://api.devnet.solana.com",
             &payer,
@@ -3214,6 +3308,7 @@ mod devnet_tests {
                     argument_after(command, "--max-len"),
                     artifact.len().to_string()
                 );
+                assert_eq!(argument_after(command, "--max-sign-attempts"), "20");
                 for flag in ["--fee-payer", "--program-id", "--buffer"] {
                     let path = PathBuf::from(argument_after(command, flag));
                     assert!(path.exists());
@@ -3233,6 +3328,7 @@ mod devnet_tests {
                 }
                 Ok(true)
             },
+            |_| panic!("successful deploy must not refund its buffer"),
         )
         .unwrap();
 
@@ -3246,11 +3342,12 @@ mod devnet_tests {
         let directory = tempfile::tempdir().unwrap();
         let payer = Keypair::new();
         let artifact = b"\x7fELFcheckpoint";
-        let mut buffer = None;
-        let mut signer_paths = Vec::new();
-        let mut invocation = 0;
+        let buffer = std::cell::Cell::new(None);
+        let signer_paths = std::cell::RefCell::new(Vec::new());
+        let deploy_invocations = std::cell::Cell::new(0);
+        let refund_invocations = std::cell::Cell::new(0);
 
-        let result = deploy_checkpoint_with_runner(
+        let result = deploy_checkpoint_with_runner_and_refunder(
             Path::new("/fake/solana"),
             "https://api.devnet.solana.com",
             &payer,
@@ -3259,34 +3356,27 @@ mod devnet_tests {
             directory.path(),
             artifact,
             |command: &mut Command| {
-                invocation += 1;
-                if invocation == 1 {
-                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
-                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
-                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
-                    signer_paths.extend([payer_path, buffer_path]);
-                    return Ok(false);
-                }
-                let arguments = command_args(command);
-                assert_eq!(
-                    &arguments[..3],
-                    ["program", "close", &buffer.unwrap().to_string()]
-                );
-                assert!(arguments.iter().any(|argument| argument == "--buffers"));
-                assert_eq!(
-                    argument_after(command, "--recipient"),
-                    payer.pubkey().to_string()
-                );
-                for path in &signer_paths {
+                deploy_invocations.set(deploy_invocations.get() + 1);
+                let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                buffer.set(Some(read_keypair_file(&buffer_path).unwrap().pubkey()));
+                signer_paths.borrow_mut().extend([payer_path, buffer_path]);
+                Ok(false)
+            },
+            |actual_buffer| {
+                refund_invocations.set(refund_invocations.get() + 1);
+                assert_eq!(Some(actual_buffer), buffer.get());
+                for path in signer_paths.borrow().iter() {
                     assert!(path.exists());
                 }
-                Ok(true)
+                Ok(())
             },
         );
 
         assert_eq!(result, Err("Solana program deploy failed".to_owned()));
-        assert_eq!(invocation, 2);
-        assert!(signer_paths.iter().all(|path| !path.exists()));
+        assert_eq!(deploy_invocations.get(), 1);
+        assert_eq!(refund_invocations.get(), 1);
+        assert!(signer_paths.borrow().iter().all(|path| !path.exists()));
     }
 
     #[cfg(unix)]
@@ -3295,11 +3385,12 @@ mod devnet_tests {
         let directory = tempfile::tempdir().unwrap();
         let payer = Keypair::new();
         let artifact = b"\x7fELFcheckpoint";
-        let mut buffer = None;
-        let mut signer_paths = Vec::new();
-        let mut invocation = 0;
+        let buffer = std::cell::Cell::new(None);
+        let signer_paths = std::cell::RefCell::new(Vec::new());
+        let deploy_invocations = std::cell::Cell::new(0);
+        let refund_invocations = std::cell::Cell::new(0);
 
-        let result = deploy_checkpoint_with_runner(
+        let result = deploy_checkpoint_with_runner_and_refunder(
             Path::new("/fake/solana"),
             "https://api.devnet.solana.com",
             &payer,
@@ -3308,23 +3399,20 @@ mod devnet_tests {
             directory.path(),
             artifact,
             |command: &mut Command| {
-                invocation += 1;
-                if invocation == 1 {
-                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
-                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
-                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
-                    signer_paths.extend([payer_path, buffer_path]);
-                    return Err(());
-                }
-                let arguments = command_args(command);
-                assert_eq!(
-                    &arguments[..3],
-                    ["program", "close", &buffer.unwrap().to_string()]
-                );
-                for path in &signer_paths {
+                deploy_invocations.set(deploy_invocations.get() + 1);
+                let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                buffer.set(Some(read_keypair_file(&buffer_path).unwrap().pubkey()));
+                signer_paths.borrow_mut().extend([payer_path, buffer_path]);
+                Err(())
+            },
+            |actual_buffer| {
+                refund_invocations.set(refund_invocations.get() + 1);
+                assert_eq!(Some(actual_buffer), buffer.get());
+                for path in signer_paths.borrow().iter() {
                     assert!(path.exists());
                 }
-                Ok(true)
+                Ok(())
             },
         );
 
@@ -3332,8 +3420,9 @@ mod devnet_tests {
             result,
             Err("launch Solana program deploy failed".to_owned())
         );
-        assert_eq!(invocation, 2);
-        assert!(signer_paths.iter().all(|path| !path.exists()));
+        assert_eq!(deploy_invocations.get(), 1);
+        assert_eq!(refund_invocations.get(), 1);
+        assert!(signer_paths.borrow().iter().all(|path| !path.exists()));
     }
 
     #[cfg(unix)]
@@ -3342,11 +3431,12 @@ mod devnet_tests {
         let directory = tempfile::tempdir().unwrap();
         let payer = Keypair::new();
         let artifact = b"\x7fELFcheckpoint";
-        let mut buffer = None;
-        let mut signer_paths = Vec::new();
-        let mut invocation = 0;
+        let buffer = std::cell::Cell::new(None);
+        let signer_paths = std::cell::RefCell::new(Vec::new());
+        let deploy_invocations = std::cell::Cell::new(0);
+        let refund_invocations = std::cell::Cell::new(0);
 
-        let error = deploy_checkpoint_with_runner(
+        let error = deploy_checkpoint_with_runner_and_refunder(
             Path::new("/fake/solana"),
             "https://api.devnet.solana.com",
             &payer,
@@ -3355,13 +3445,16 @@ mod devnet_tests {
             directory.path(),
             artifact,
             |command: &mut Command| {
-                invocation += 1;
-                if invocation == 1 {
-                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
-                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
-                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
-                    signer_paths.extend([payer_path, buffer_path]);
-                }
+                deploy_invocations.set(deploy_invocations.get() + 1);
+                let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                buffer.set(Some(read_keypair_file(&buffer_path).unwrap().pubkey()));
+                signer_paths.borrow_mut().extend([payer_path, buffer_path]);
+                Err(())
+            },
+            |actual_buffer| {
+                refund_invocations.set(refund_invocations.get() + 1);
+                assert_eq!(Some(actual_buffer), buffer.get());
                 Err(())
             },
         )
@@ -3371,11 +3464,12 @@ mod devnet_tests {
             error,
             format!(
                 "Solana program deploy failed; buffer cleanup failed: {}",
-                buffer.unwrap()
+                buffer.get().unwrap()
             )
         );
-        assert_eq!(invocation, 2);
-        assert!(signer_paths.iter().all(|path| !path.exists()));
+        assert_eq!(deploy_invocations.get(), 1);
+        assert_eq!(refund_invocations.get(), 1);
+        assert!(signer_paths.borrow().iter().all(|path| !path.exists()));
     }
 
     #[test]
@@ -3396,10 +3490,11 @@ mod devnet_tests {
         let directory = tempfile::tempdir().unwrap();
         let payer = Keypair::new();
         let artifact = b"\x7fELFcheckpoint";
-        let mut buffer = None;
-        let mut invocation = 0;
+        let buffer = std::cell::Cell::new(None);
+        let deploy_invocations = std::cell::Cell::new(0);
+        let refund_invocations = std::cell::Cell::new(0);
 
-        let error = deploy_checkpoint_with_runner(
+        let error = deploy_checkpoint_with_runner_and_refunder(
             Path::new("/fake/solana"),
             "https://api.devnet.solana.com",
             &payer,
@@ -3408,12 +3503,15 @@ mod devnet_tests {
             directory.path(),
             artifact,
             |command: &mut Command| {
-                invocation += 1;
-                if invocation == 1 {
-                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
-                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
-                }
+                deploy_invocations.set(deploy_invocations.get() + 1);
+                let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                buffer.set(Some(read_keypair_file(&buffer_path).unwrap().pubkey()));
                 Ok(false)
+            },
+            |actual_buffer| {
+                refund_invocations.set(refund_invocations.get() + 1);
+                assert_eq!(Some(actual_buffer), buffer.get());
+                Err(())
             },
         )
         .unwrap_err();
@@ -3422,9 +3520,11 @@ mod devnet_tests {
             error,
             format!(
                 "Solana program deploy failed; buffer cleanup failed: {}",
-                buffer.unwrap()
+                buffer.get().unwrap()
             )
         );
+        assert_eq!(deploy_invocations.get(), 1);
+        assert_eq!(refund_invocations.get(), 1);
     }
 
     #[test]
