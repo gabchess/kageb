@@ -135,14 +135,25 @@ fn publish_bytes_noclobber(out: &Path, bytes: &[u8]) -> Result<(), String> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|_| "create evidence directory failed".to_owned())?;
-    let parent_metadata =
-        fs::symlink_metadata(parent).map_err(|_| "inspect evidence directory failed".to_owned())?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err("evidence directory must be a real directory".to_owned());
-    }
-    #[cfg(unix)]
-    if parent_metadata.permissions().mode() & 0o022 != 0 {
-        return Err("evidence directory must not be group or world writable".to_owned());
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| "locate evidence directory failed".to_owned())?
+            .join(parent)
+    };
+    for ancestor in absolute_parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| "inspect evidence directory ancestry failed".to_owned())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("evidence directory ancestry must contain real directories".to_owned());
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(
+                "evidence directory ancestry must not be group or world writable".to_owned(),
+            );
+        }
     }
     let mut pending = tempfile::NamedTempFile::new_in(parent)
         .map_err(|_| "create pending evidence failed".to_owned())?;
@@ -1729,7 +1740,7 @@ where
             .args(["--output", "json"]);
         runner(&mut command)
     };
-    let buffer_cleanup_failed = if deploy_status == Ok(false) {
+    let buffer_cleanup_failed = if deploy_status != Ok(true) {
         let mut command = Command::new(solana);
         command
             .args(["program", "close"])
@@ -3013,6 +3024,14 @@ mod devnet_tests {
         arguments[position + 1].clone()
     }
 
+    fn trusted_publication_directory() -> TempDir {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        tempfile::tempdir_in(repository).unwrap()
+    }
+
     fn program_account(programdata: Pubkey) -> PublicAccountSnapshotV1 {
         let mut data = 2_u32.to_le_bytes().to_vec();
         data.extend_from_slice(programdata.as_ref());
@@ -3251,6 +3270,95 @@ mod devnet_tests {
 
     #[cfg(unix)]
     #[test]
+    fn deploy_runner_error_refunds_the_buffer_before_removing_signers() {
+        let directory = tempfile::tempdir().unwrap();
+        let payer = Keypair::new();
+        let artifact = b"\x7fELFcheckpoint";
+        let mut buffer = None;
+        let mut signer_paths = Vec::new();
+        let mut invocation = 0;
+
+        let result = deploy_checkpoint_with_runner(
+            Path::new("/fake/solana"),
+            "https://api.devnet.solana.com",
+            &payer,
+            None,
+            DevnetDeploymentAction::Upgrade,
+            directory.path(),
+            artifact,
+            |command: &mut Command| {
+                invocation += 1;
+                if invocation == 1 {
+                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
+                    signer_paths.extend([payer_path, buffer_path]);
+                    return Err(());
+                }
+                let arguments = command_args(command);
+                assert_eq!(
+                    &arguments[..3],
+                    ["program", "close", &buffer.unwrap().to_string()]
+                );
+                for path in &signer_paths {
+                    assert!(path.exists());
+                }
+                Ok(true)
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err("launch Solana program deploy failed".to_owned())
+        );
+        assert_eq!(invocation, 2);
+        assert!(signer_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_runner_and_refund_errors_report_only_the_public_buffer_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let payer = Keypair::new();
+        let artifact = b"\x7fELFcheckpoint";
+        let mut buffer = None;
+        let mut signer_paths = Vec::new();
+        let mut invocation = 0;
+
+        let error = deploy_checkpoint_with_runner(
+            Path::new("/fake/solana"),
+            "https://api.devnet.solana.com",
+            &payer,
+            None,
+            DevnetDeploymentAction::Upgrade,
+            directory.path(),
+            artifact,
+            |command: &mut Command| {
+                invocation += 1;
+                if invocation == 1 {
+                    let payer_path = PathBuf::from(argument_after(command, "--fee-payer"));
+                    let buffer_path = PathBuf::from(argument_after(command, "--buffer"));
+                    buffer = Some(read_keypair_file(&buffer_path).unwrap().pubkey());
+                    signer_paths.extend([payer_path, buffer_path]);
+                }
+                Err(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!(
+                "Solana program deploy failed; buffer cleanup failed: {}",
+                buffer.unwrap()
+            )
+        );
+        assert_eq!(invocation, 2);
+        assert!(signer_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_buffer_refund_reports_only_the_recoverable_public_buffer_address() {
         let directory = tempfile::tempdir().unwrap();
         let payer = Keypair::new();
@@ -3288,7 +3396,7 @@ mod devnet_tests {
 
     #[test]
     fn evidence_publication_never_clobbers_an_existing_path() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = trusted_publication_directory();
         let output = directory.path().join("proof.json");
         fs::write(&output, b"winner").unwrap();
 
@@ -3298,38 +3406,53 @@ mod devnet_tests {
 
     #[cfg(unix)]
     #[test]
-    fn evidence_publication_rejects_a_symlinked_output_parent() {
+    fn evidence_publication_rejects_a_symlinked_output_ancestor() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = trusted_publication_directory();
         let real_parent = directory.path().join("real");
         let linked_parent = directory.path().join("linked");
         fs::create_dir(&real_parent).unwrap();
+        fs::create_dir(real_parent.join("safe-child")).unwrap();
         symlink(&real_parent, &linked_parent).unwrap();
-        let output = linked_parent.join("proof.json");
+        let output = linked_parent.join("safe-child/proof.json");
 
         assert!(publish_bytes_noclobber(&output, b"proof").is_err());
-        assert!(!real_parent.join("proof.json").exists());
+        assert!(!real_parent.join("safe-child/proof.json").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn evidence_publication_rejects_a_group_or_world_writable_parent() {
-        let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("shared");
-        fs::create_dir(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
-        let output = parent.join("proof.json");
+    fn evidence_publication_rejects_a_group_or_world_writable_ancestor() {
+        let directory = trusted_publication_directory();
+        let shared = directory.path().join("shared");
+        let safe_child = shared.join("safe-child");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir(&safe_child).unwrap();
+        fs::set_permissions(&safe_child, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = safe_child.join("proof.json");
 
         assert!(publish_bytes_noclobber(&output, b"proof").is_err());
         assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_publication_accepts_the_normal_repository_ancestry() {
+        let directory = trusted_publication_directory();
+        let output = directory.path().join("proof.json");
+
+        publish_bytes_noclobber(&output, b"proof").unwrap();
+
+        assert_eq!(fs::read(output).unwrap(), b"proof");
     }
 
     #[test]
     fn concurrent_evidence_publication_has_exactly_one_winner() {
         use std::sync::{Arc, Barrier};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = trusted_publication_directory();
         let output = directory.path().join("proof.json");
         let barrier = Arc::new(Barrier::new(2));
         let attempts: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
