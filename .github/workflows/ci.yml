@@ -90,3 +90,14 @@ jobs:
           echo "$RUNNER_TEMP/solana-release/bin" >> "$GITHUB_PATH"
       - name: Verify public devnet evidence
         run: ./scripts/verify-public-evidence.sh
+      - name: Build Linux SBF diagnostic
+        if: failure()
+        run: cargo build-sbf --manifest-path crates/kageb-program/Cargo.toml -- --locked
+      - name: Upload Linux SBF diagnostic
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-sbf-diagnostic
+          path: target/deploy/kageb_program.so
+          if-no-files-found: error
+          retention-days: 1
