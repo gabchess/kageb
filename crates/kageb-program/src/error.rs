@@ -17,6 +17,7 @@ pub enum KagebError {
     InvalidLock = 12,
     InsufficientQuorum = 13,
     ArithmeticOverflow = 14,
+    InvalidSettlement = 15,
 }
 
 impl From<KagebError> for ProgramError {

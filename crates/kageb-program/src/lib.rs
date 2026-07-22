@@ -10,6 +10,7 @@ pub mod wire;
 use solana_program::pubkey::Pubkey;
 
 pub const ID: Pubkey = solana_program::pubkey!("HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77");
+// Settlement V1 uses classic SPL Token only; Token-2022 accounts fail owner checks.
 pub const TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 

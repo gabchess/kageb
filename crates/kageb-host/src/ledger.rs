@@ -115,6 +115,10 @@ impl BatchResult {
         self.balances.get(&participant_id).copied()
     }
 
+    pub(crate) const fn balances(&self) -> &BTreeMap<ParticipantId, PoolBalance> {
+        &self.balances
+    }
+
     #[must_use]
     pub fn conserves(&self, before: &BTreeMap<ParticipantId, PoolBalance>) -> bool {
         let Some((before_base, before_quote)) = totals(before) else {

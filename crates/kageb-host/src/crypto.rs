@@ -8,16 +8,18 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
 use sha2::{Digest, Sha256};
-#[cfg(test)]
 use threshold_crypto::DecryptionShare;
 use threshold_crypto::{Ciphertext, PublicKeySet, SecretKeySet, SecretKeyShare};
 use zeroize::Zeroize;
+
+use solana_program::pubkey::Pubkey;
 
 use crate::{IntentBodyV1, ProtocolError, UnsignedFundedAuthorizationV1};
 
 const FUNDED_AUTH_DOMAIN: &[u8] = b"KAGEB_FUNDED_AUTH_V1\0";
 const INTENT_DOMAIN: &[u8] = b"KAGEB_INTENT_V1\0";
 const SUBMISSION_DOMAIN: &[u8] = b"KAGEB_SUBMISSION_V1\0";
+const EPOCH_KEY_SET_DOMAIN: &[u8] = b"KAGEB_EPOCH_KEY_SET_V1\0";
 const AUTHORIZATION_VERSION: u8 = 1;
 const SIGNED_INTENT_LEN: usize = 192;
 pub const FUNDED_AUTHORIZATION_V1_LEN: usize = 249;
@@ -108,7 +110,7 @@ impl fmt::Debug for FundedAuthorizationV1 {
 
 impl FundedAuthorizationV1 {
     #[must_use]
-    pub fn sign(
+    pub(crate) fn sign(
         reserved: UnsignedFundedAuthorizationV1,
         epoch_id: [u8; 32],
         trading_key: VerifyingKey,
@@ -348,6 +350,11 @@ impl SignedIntentV1 {
                 .map_err(|_| CryptoError::InvalidSignedIntent)?,
         })
     }
+
+    #[must_use]
+    pub const fn body(&self) -> &IntentBodyV1 {
+        &self.body
+    }
 }
 
 impl fmt::Debug for SignedIntentV1 {
@@ -376,26 +383,93 @@ impl EncryptedIntentV1 {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EpochPublicKeys {
     keys: PublicKeySet,
 }
 
+impl fmt::Debug for EpochPublicKeys {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EpochPublicKeys(..public)")
+    }
+}
+
 impl EpochPublicKeys {
+    pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CryptoError> {
+        codec()
+            .serialize(&self.keys)
+            .map_err(|_| CryptoError::InvalidShare)
+    }
+
+    pub(crate) fn decode_wire(encoded: &[u8]) -> Result<Self, CryptoError> {
+        let keys: PublicKeySet = codec()
+            .with_limit(1_024)
+            .deserialize(encoded)
+            .map_err(|_| CryptoError::InvalidShare)?;
+        if keys.threshold() != 1 {
+            return Err(CryptoError::InvalidShare);
+        }
+        Ok(Self { keys })
+    }
+
+    pub(crate) fn commitment_leaf(&self) -> Result<Vec<u8>, CryptoError> {
+        let encoded = self.encode_wire()?;
+        let mut leaf = Vec::with_capacity(EPOCH_KEY_SET_DOMAIN.len() + encoded.len());
+        leaf.extend_from_slice(EPOCH_KEY_SET_DOMAIN);
+        leaf.extend_from_slice(&encoded);
+        Ok(leaf)
+    }
+
+    pub(crate) fn matches_share(&self, share: &KeyperSecretShare) -> bool {
+        self.keys.public_key_share(share.index).to_bytes()
+            == share.secret.public_key_share().to_bytes()
+    }
+
     pub fn encrypt(&self, intent: &SignedIntentV1) -> Result<EncryptedIntentV1, CryptoError> {
         let ciphertext = self.keys.public_key().encrypt(intent.encode());
         encode_ciphertext(ciphertext)
+    }
+
+    /// Encrypts a fixed-width signed-intent wire value before semantic validation.
+    ///
+    /// Admission is deliberately structural: malformed plaintext is discovered only
+    /// after the frozen batch reveals.
+    pub fn encrypt_encoded_intent(&self, encoded: &[u8]) -> Result<EncryptedIntentV1, CryptoError> {
+        if encoded.len() != SIGNED_INTENT_LEN {
+            return Err(CryptoError::InvalidSignedIntent);
+        }
+        encode_ciphertext(self.keys.public_key().encrypt(encoded))
     }
 
     pub fn decode_ciphertext(&self, encoded: &[u8]) -> Result<EncryptedIntentV1, CryptoError> {
         decode_ciphertext(encoded)
     }
 
-    #[cfg(test)]
-    fn recover<'a>(
+    pub fn recover_submission<'a>(
+        &self,
+        submission: &EncryptedSubmissionV1,
+        shares: impl IntoIterator<Item = &'a ReleasedShareV1>,
+    ) -> Result<SignedIntentV1, CryptoError> {
+        let shares: Vec<_> = shares.into_iter().collect();
+        let ciphertext_hash: [u8; 32] = Sha256::digest(&submission.ciphertext).into();
+        let Some(first) = shares.first() else {
+            return Err(CryptoError::InsufficientShares);
+        };
+        if shares.iter().any(|share| {
+            share.epoch_account != first.epoch_account
+                || share.lock_digest != first.lock_digest
+                || share.ciphertext_hash != ciphertext_hash
+        }) {
+            return Err(CryptoError::InvalidShare);
+        }
+        let encrypted = decode_ciphertext(&submission.ciphertext)?;
+        self.recover(&encrypted, shares)
+    }
+
+    pub fn recover<'a>(
         &self,
         encrypted: &EncryptedIntentV1,
-        shares: impl IntoIterator<Item = &'a IndexedDecryptionShare>,
+        shares: impl IntoIterator<Item = &'a ReleasedShareV1>,
     ) -> Result<SignedIntentV1, CryptoError> {
         let shares: Vec<_> = shares.into_iter().collect();
         if shares.len() < 2 {
@@ -425,6 +499,128 @@ impl EpochPublicKeys {
     }
 }
 
+#[derive(Clone)]
+pub struct ReleasedShareV1 {
+    epoch_account: Pubkey,
+    lock_digest: [u8; 32],
+    ciphertext_hash: [u8; 32],
+    index: usize,
+    share: DecryptionShare,
+}
+
+impl std::fmt::Debug for ReleasedShareV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReleasedShareV1(..redacted)")
+    }
+}
+
+impl ReleasedShareV1 {
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    #[must_use]
+    pub const fn epoch_account(&self) -> Pubkey {
+        self.epoch_account
+    }
+
+    #[must_use]
+    pub const fn lock_digest(&self) -> [u8; 32] {
+        self.lock_digest
+    }
+
+    #[must_use]
+    pub fn verify(
+        &self,
+        public_keys: &EpochPublicKeys,
+        submission: &EncryptedSubmissionV1,
+    ) -> bool {
+        let ciphertext_hash: [u8; 32] = Sha256::digest(&submission.ciphertext).into();
+        if self.ciphertext_hash != ciphertext_hash {
+            return false;
+        }
+        let Ok(encrypted) = decode_ciphertext(&submission.ciphertext) else {
+            return false;
+        };
+        public_keys
+            .keys
+            .public_key_share(self.index)
+            .verify_decryption_share(&self.share, &encrypted.ciphertext)
+    }
+
+    pub(crate) fn from_share(
+        epoch_account: Pubkey,
+        lock_digest: [u8; 32],
+        ciphertext_hash: [u8; 32],
+        index: usize,
+        share: DecryptionShare,
+    ) -> Self {
+        Self {
+            epoch_account,
+            lock_digest,
+            ciphertext_hash,
+            index,
+            share,
+        }
+    }
+
+    pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CryptoError> {
+        let encoded_share = codec()
+            .serialize(&self.share)
+            .map_err(|_| CryptoError::InvalidShare)?;
+        let share_len =
+            u32::try_from(encoded_share.len()).map_err(|_| CryptoError::InvalidShare)?;
+        let mut bytes = Vec::with_capacity(109 + encoded_share.len());
+        bytes.push(1);
+        bytes.extend_from_slice(&(self.index as u64).to_le_bytes());
+        bytes.extend_from_slice(self.epoch_account.as_ref());
+        bytes.extend_from_slice(&self.lock_digest);
+        bytes.extend_from_slice(&self.ciphertext_hash);
+        bytes.extend_from_slice(&share_len.to_le_bytes());
+        bytes.extend_from_slice(&encoded_share);
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode_wire(bytes: &[u8]) -> Result<Self, CryptoError> {
+        const PREFIX: usize = 109;
+        if bytes.len() < PREFIX || bytes[0] != 1 {
+            return Err(CryptoError::InvalidShare);
+        }
+        let share_len = u32::from_le_bytes(
+            bytes[105..109]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidShare)?,
+        ) as usize;
+        if PREFIX.checked_add(share_len) != Some(bytes.len()) {
+            return Err(CryptoError::InvalidShare);
+        }
+        let share = codec()
+            .deserialize(&bytes[PREFIX..])
+            .map_err(|_| CryptoError::InvalidShare)?;
+        Ok(Self {
+            index: usize::try_from(u64::from_le_bytes(
+                bytes[1..9]
+                    .try_into()
+                    .map_err(|_| CryptoError::InvalidShare)?,
+            ))
+            .map_err(|_| CryptoError::InvalidShare)?,
+            epoch_account: Pubkey::new_from_array(
+                bytes[9..41]
+                    .try_into()
+                    .map_err(|_| CryptoError::InvalidShare)?,
+            ),
+            lock_digest: bytes[41..73]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidShare)?,
+            ciphertext_hash: bytes[73..105]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidShare)?,
+            share,
+        })
+    }
+}
+
 pub struct EpochDealer {
     secrets: SecretKeySet,
     public: EpochPublicKeys,
@@ -450,8 +646,9 @@ impl EpochDealer {
     }
 
     #[must_use]
-    pub fn share(&self, index: usize) -> KeyperSecretShare {
+    pub fn share(&self, epoch_account: Pubkey, index: usize) -> KeyperSecretShare {
         KeyperSecretShare {
+            epoch_account,
             index,
             secret: self.secrets.secret_key_share(index),
         }
@@ -459,24 +656,45 @@ impl EpochDealer {
 }
 
 pub struct KeyperSecretShare {
+    epoch_account: Pubkey,
     index: usize,
     secret: SecretKeyShare,
 }
 
 impl KeyperSecretShare {
     #[cfg(test)]
-    fn decrypt(
-        &self,
-        encrypted: &EncryptedIntentV1,
-    ) -> Result<IndexedDecryptionShare, CryptoError> {
+    fn decrypt(&self, encrypted: &EncryptedIntentV1) -> Result<ReleasedShareV1, CryptoError> {
         let share = self
             .secret
             .decrypt_share(&encrypted.ciphertext)
             .ok_or(CryptoError::InvalidCiphertext)?;
-        Ok(IndexedDecryptionShare {
+        Ok(ReleasedShareV1 {
+            epoch_account: Pubkey::default(),
+            lock_digest: [0; 32],
+            ciphertext_hash: Sha256::digest(encrypted.as_bytes()).into(),
             index: self.index,
             share,
         })
+    }
+
+    pub(crate) fn release(
+        &self,
+        epoch_account: Pubkey,
+        lock_digest: [u8; 32],
+        ciphertext: &[u8],
+    ) -> Result<ReleasedShareV1, CryptoError> {
+        let encrypted = decode_ciphertext(ciphertext)?;
+        let share = self
+            .secret
+            .decrypt_share(&encrypted.ciphertext)
+            .ok_or(CryptoError::InvalidCiphertext)?;
+        Ok(ReleasedShareV1::from_share(
+            epoch_account,
+            lock_digest,
+            Sha256::digest(ciphertext).into(),
+            self.index,
+            share,
+        ))
     }
 
     #[must_use]
@@ -488,15 +706,25 @@ impl KeyperSecretShare {
         self.index
     }
 
+    pub(crate) const fn epoch_account(&self) -> Pubkey {
+        self.epoch_account
+    }
+
     pub(crate) const fn secret(&self) -> &SecretKeyShare {
         &self.secret
     }
-}
 
-#[cfg(test)]
-struct IndexedDecryptionShare {
-    index: usize,
-    share: DecryptionShare,
+    pub(crate) const fn from_secret(
+        epoch_account: Pubkey,
+        index: usize,
+        secret: SecretKeyShare,
+    ) -> Self {
+        Self {
+            epoch_account,
+            index,
+            secret,
+        }
+    }
 }
 
 fn encode_ciphertext(ciphertext: Ciphertext) -> Result<EncryptedIntentV1, CryptoError> {
@@ -552,6 +780,11 @@ impl fmt::Debug for EncryptedSubmissionV1 {
 }
 
 impl EncryptedSubmissionV1 {
+    #[must_use]
+    pub const fn participant_id(&self) -> [u8; 32] {
+        self.authorization.participant_id()
+    }
+
     pub fn sign(
         authorization: FundedAuthorizationV1,
         encrypted: EncryptedIntentV1,
@@ -744,8 +977,14 @@ mod tests {
         let (trading, signed) = signed_intent(epoch);
         let dealer = EpochDealer::random().expect("dealer");
         let encrypted = dealer.public_keys().encrypt(&signed).expect("encrypt");
+        let epoch_account = Pubkey::new_unique();
         let shares: Vec<_> = (0..3)
-            .map(|index| dealer.share(index).decrypt(&encrypted).expect("share"))
+            .map(|index| {
+                dealer
+                    .share(epoch_account, index)
+                    .decrypt(&encrypted)
+                    .expect("share")
+            })
             .collect();
 
         for share in &shares {
@@ -770,7 +1009,7 @@ mod tests {
 
         let wrong_dealer = EpochDealer::random().expect("wrong dealer");
         let wrong_share = wrong_dealer
-            .share(1)
+            .share(epoch_account, 1)
             .decrypt(&encrypted)
             .expect("structural share");
         assert_eq!(

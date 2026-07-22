@@ -8,12 +8,13 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use kageb::{run_keyper_self_test, EpochDealer};
+use solana_program::pubkey::Pubkey;
 use tempfile::tempdir;
 
 #[test]
 fn one_shot_keyper_receives_one_share_only_through_stdin() {
     let dealer = EpochDealer::random().expect("dealer");
-    let share = dealer.share(1);
+    let share = dealer.share(Pubkey::new_unique(), 1);
     let directory = tempdir().expect("tempdir");
     #[cfg(unix)]
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -42,7 +43,7 @@ fn one_shot_keyper_receives_one_share_only_through_stdin() {
 }
 
 #[test]
-fn post_lock_keyper_operations_are_explicitly_unsupported() {
+fn post_lock_keyper_operations_reject_missing_one_shot_requests() {
     for operation in ["release-share", "sign-settlement"] {
         let output = Command::new(env!("CARGO_BIN_EXE_kageb"))
             .args(["keyper", operation])
@@ -51,7 +52,7 @@ fn post_lock_keyper_operations_are_explicitly_unsupported() {
         assert!(!output.status.success());
         assert!(String::from_utf8(output.stderr)
             .expect("utf8")
-            .contains("unsupported until a confirmed onchain lock exists"));
+            .contains("request rejected"));
     }
 }
 

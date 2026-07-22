@@ -69,7 +69,7 @@ fn instruction_codecs_reject_trailing_or_malformed_data() {
 }
 
 #[test]
-fn settlement_has_exact_wire_codec_builder_and_fails_closed_in_ticket_three() {
+fn settlement_has_exact_wire_codec_and_account_builder() {
     let payload = SettlementPayloadV1 {
         epoch_account: key(22),
         lock_digest: [2; 32],
@@ -87,13 +87,13 @@ fn settlement_has_exact_wire_codec_builder_and_fails_closed_in_ticket_three() {
         venue_authority: key(26),
         settlement_nonce: [12; 32],
     };
-    let encoded = KagebInstruction::Settle(payload).encode();
-    assert_eq!(encoded.len(), 1 + SettlementPayloadV1::ENCODED_LEN);
+    let compact = payload.into();
+    let encoded = KagebInstruction::Settle(compact).encode();
+    assert_eq!(encoded.len(), 70);
     assert_eq!(encoded[0], 3);
-    assert_eq!(&encoded[1..], &payload.encode());
     assert_eq!(
         KagebInstruction::decode(&encoded).unwrap(),
-        KagebInstruction::Settle(payload)
+        KagebInstruction::Settle(compact)
     );
     assert!(KagebInstruction::decode(&encoded[..encoded.len() - 1]).is_err());
     let mut trailing = encoded.clone();
@@ -116,6 +116,9 @@ fn settlement_has_exact_wire_codec_builder_and_fails_closed_in_ticket_three() {
     let instruction = settle_instruction(accounts, payload);
     assert_eq!(instruction.program_id, ID);
     assert_eq!(instruction.data, encoded);
+    let mut removed_route = encoded.clone();
+    removed_route[0] = 6;
+    assert!(KagebInstruction::decode(&removed_route).is_err());
     assert_eq!(
         instruction.accounts,
         vec![
@@ -137,7 +140,7 @@ fn settlement_has_exact_wire_codec_builder_and_fails_closed_in_ticket_three() {
     );
     assert_eq!(
         process_instruction(&ID, &[], &encoded),
-        Err(KagebError::InvalidInstruction.into())
+        Err(KagebError::InvalidAccounts.into())
     );
 }
 

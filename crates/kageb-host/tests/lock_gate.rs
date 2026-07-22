@@ -16,10 +16,11 @@ use std::os::unix::fs::PermissionsExt;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::SigningKey;
 use kageb::{
-    run_keyper_sign_lock, BalanceRecordV1, EncryptedSubmissionV1, EpochDealer,
-    FundedAuthorizationV1, IntentBodyV1, KeyperProcessError, LockJournal, LockPackageV1,
-    LockValidationError, PoolBalance, ProgramClient, ReferenceKeyper, ReservationJournal,
-    ReservationRecord, Side, SignedBalanceSnapshotV1, SignedIntentV1,
+    run_keyper_release_share, run_keyper_sign_lock, run_keyper_sign_settlement, BalanceRecordV1,
+    CryptoError, DecryptionEvidenceV1, EncryptedSubmissionV1, EpochDealer, IntentBodyV1,
+    KeyperProcessError, LockJournal, LockPackageV1, LockValidationError, PoolBalance,
+    ProgramClient, ReferenceKeyper, ReservationJournal, ReservationRecord, Residual,
+    SettlementRequestV1, Side, SignedBalanceSnapshotV1, SignedIntentV1, SuspensionRegistry,
 };
 use kageb_program::{
     epoch_address, pool_address,
@@ -55,6 +56,15 @@ fn submission(
     dealer: &EpochDealer,
     operator: &SigningKey,
 ) -> EncryptedSubmissionV1 {
+    submission_with_intent(id, epoch_id, dealer, operator).0
+}
+
+fn submission_with_intent(
+    id: u8,
+    epoch_id: [u8; 32],
+    dealer: &EpochDealer,
+    operator: &SigningKey,
+) -> (EncryptedSubmissionV1, SignedIntentV1) {
     let trader = key(id);
     let directory = tempdir().unwrap();
     let mut reservations = ReservationJournal::open(directory.path().join("r.bin")).unwrap();
@@ -64,17 +74,26 @@ fn submission(
             PoolBalance::new(1, 100),
         )
         .unwrap();
-    let authorization =
-        FundedAuthorizationV1::sign(reserved, epoch_id, trader.verifying_key(), operator, 1_000);
-    let body = IntentBodyV1::new(Side::Buy, 1, 100, epoch_id, [id; 32], [id; 16]).unwrap();
-    let encrypted = dealer
-        .public_keys()
-        .encrypt(&SignedIntentV1::sign(body, &trader))
+    let authorization = SuspensionRegistry::open(directory.path().join("suspensions.bin"))
+        .unwrap()
+        .issue_authorization(reserved, epoch_id, trader.verifying_key(), operator, 1_000)
         .unwrap();
-    EncryptedSubmissionV1::sign(authorization, encrypted, [id + 20; 32], &trader).unwrap()
+    let body = IntentBodyV1::new(Side::Buy, 1, 100, epoch_id, [id; 32], [id; 16]).unwrap();
+    let signed = SignedIntentV1::sign(body, &trader);
+    let encrypted = dealer.public_keys().encrypt(&signed).unwrap();
+    (
+        EncryptedSubmissionV1::sign(authorization, encrypted, [id + 20; 32], &trader).unwrap(),
+        signed,
+    )
 }
 
-fn valid_package() -> (LockPackageV1, SigningKey, [SigningKey; 3]) {
+fn valid_package() -> (
+    LockPackageV1,
+    SigningKey,
+    [SigningKey; 3],
+    EpochDealer,
+    Vec<SignedIntentV1>,
+) {
     let operator = key(90);
     let attesters = [key(70), key(71), key(72)];
     let epoch_id = [42; 32];
@@ -87,9 +106,9 @@ fn valid_package() -> (LockPackageV1, SigningKey, [SigningKey; 3]) {
     );
     let (epoch_account, _) = epoch_address(&pool, &epoch_id);
     let dealer = EpochDealer::random().unwrap();
-    let submissions: Vec<_> = (1..=4)
-        .map(|id| submission(id, epoch_id, &dealer, &operator))
-        .collect();
+    let (submissions, intents): (Vec<_>, Vec<_>) = (1..=4)
+        .map(|id| submission_with_intent(id, epoch_id, &dealer, &operator))
+        .unzip();
     let balances: Vec<_> = (1..=4)
         .map(|id| BalanceRecordV1::new([id; 32], 1, 100, 1, 100).unwrap())
         .collect();
@@ -113,13 +132,14 @@ fn valid_package() -> (LockPackageV1, SigningKey, [SigningKey; 3]) {
     let package = LockPackageV1::new(
         epoch_account,
         config,
+        dealer.public_keys().clone(),
         submissions,
         balances,
         snapshot,
         [9; 32],
     )
     .unwrap();
-    (package, operator, attesters)
+    (package, operator, attesters, dealer, intents)
 }
 
 struct MockRpc {
@@ -336,7 +356,10 @@ fn serve_rpc(mut stream: TcpStream, epoch: &Value, accounts: &[Value]) -> Result
         .map_err(|error| format!("invalid JSON-RPC body: {error}"))?;
     let value = match body["method"].as_str() {
         Some("getAccountInfo") => epoch.clone(),
-        Some("getMultipleAccounts") => Value::Array(accounts.to_vec()),
+        Some("getMultipleAccounts") => {
+            let count = body["params"][0].as_array().map_or(0, Vec::len);
+            Value::Array(accounts[..count].to_vec())
+        }
         method => return Err(format!("unexpected RPC method: {method:?}")),
     };
     let response = serde_json::to_vec(&json!({
@@ -360,7 +383,7 @@ fn serve_rpc(mut stream: TcpStream, epoch: &Value, accounts: &[Value]) -> Result
 #[test]
 fn keyper_validates_and_journals_before_signing_one_lock_digest() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let confirmed = rpc.confirmed_open_epoch(package.epoch_account());
     let directory = tempdir().unwrap();
@@ -368,7 +391,8 @@ fn keyper_validates_and_journals_before_signing_one_lock_digest() {
     let journal = LockJournal::open(&path).unwrap();
     let mut keyper = ReferenceKeyper::new(0, attesters[0].clone(), journal);
 
-    let approval = keyper.sign_lock(&package, &confirmed).unwrap();
+    let secret = dealer.share(package.epoch_account(), 0);
+    let approval = keyper.sign_lock(&package, &confirmed, &secret).unwrap();
     assert!(approval.verify());
     assert_eq!(approval.digest(), package.lock_payload().digest());
     assert_eq!(
@@ -381,7 +405,7 @@ fn keyper_validates_and_journals_before_signing_one_lock_digest() {
     let mut conflicting = package.clone();
     conflicting.lock_nonce = [10; 32];
     assert_eq!(
-        keyper.sign_lock(&conflicting, &confirmed),
+        keyper.sign_lock(&conflicting, &confirmed, &secret),
         Err(LockValidationError::ConflictingLock)
     );
 }
@@ -389,36 +413,37 @@ fn keyper_validates_and_journals_before_signing_one_lock_digest() {
 #[test]
 fn keyper_rejects_crowd_substitution_and_corrupt_journal() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let confirmed = rpc.confirmed_open_epoch(package.epoch_account());
     let directory = tempdir().unwrap();
     let path = directory.path().join("locks.bin");
     let mut keyper =
         ReferenceKeyper::new(0, attesters[0].clone(), LockJournal::open(&path).unwrap());
+    let secret = dealer.share(package.epoch_account(), 0);
 
     let mut wrong_root = package.clone();
     wrong_root.member_root[0] ^= 1;
     assert_eq!(
-        keyper.sign_lock(&wrong_root, &confirmed),
+        keyper.sign_lock(&wrong_root, &confirmed, &secret),
         Err(LockValidationError::MemberRootMismatch)
     );
 
     let mut wrong_count = package.clone();
     wrong_count.member_count = 5;
     assert_eq!(
-        keyper.sign_lock(&wrong_count, &confirmed),
+        keyper.sign_lock(&wrong_count, &confirmed, &secret),
         Err(LockValidationError::MemberCountMismatch)
     );
 
     let mut stale = package.clone();
     stale.configuration.lock_deadline = 700;
     assert_eq!(
-        keyper.sign_lock(&stale, &confirmed),
+        keyper.sign_lock(&stale, &confirmed, &secret),
         Err(LockValidationError::InvalidConfiguration)
     );
 
-    keyper.sign_lock(&package, &confirmed).unwrap();
+    keyper.sign_lock(&package, &confirmed, &secret).unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes.truncate(bytes.len() - 1);
     fs::write(&path, bytes).unwrap();
@@ -431,7 +456,7 @@ fn keyper_rejects_crowd_substitution_and_corrupt_journal() {
 #[test]
 fn keyper_recomputes_every_lock_input_before_signing() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let confirmed = rpc.confirmed_open_epoch(package.epoch_account());
 
@@ -442,7 +467,11 @@ fn keyper_recomputes_every_lock_input_before_signing() {
             attesters[0].clone(),
             LockJournal::open(directory.path().join("locks.bin")).unwrap(),
         );
-        keyper.sign_lock(candidate, &confirmed)
+        keyper.sign_lock(
+            candidate,
+            &confirmed,
+            &dealer.share(package.epoch_account(), 0),
+        )
     };
 
     let mut bad_authorization = package.clone();
@@ -527,7 +556,11 @@ fn keyper_recomputes_every_lock_input_before_signing() {
         LockJournal::open(wrong_keyper_directory.path().join("locks.bin")).unwrap(),
     );
     assert_eq!(
-        wrong_keyper.sign_lock(&package, &confirmed),
+        wrong_keyper.sign_lock(
+            &package,
+            &confirmed,
+            &dealer.share(package.epoch_account(), 0),
+        ),
         Err(LockValidationError::WrongKeyper)
     );
 }
@@ -535,7 +568,7 @@ fn keyper_recomputes_every_lock_input_before_signing() {
 #[test]
 fn one_shot_keyper_process_validates_journals_and_signs() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let directory = tempdir().unwrap();
     #[cfg(unix)]
@@ -545,7 +578,7 @@ fn one_shot_keyper_process_validates_journals_and_signs() {
     let approval = run_keyper_sign_lock(
         env!("CARGO_BIN_EXE_kageb"),
         directory.path(),
-        1,
+        &dealer.share(package.epoch_account(), 1),
         package.configuration.keypers[1],
         &package,
     )
@@ -565,7 +598,7 @@ fn one_shot_keyper_process_validates_journals_and_signs() {
     let repeated = run_keyper_sign_lock(
         env!("CARGO_BIN_EXE_kageb"),
         directory.path(),
-        1,
+        &dealer.share(package.epoch_account(), 1),
         package.configuration.keypers[1],
         &package,
     )
@@ -578,7 +611,7 @@ fn one_shot_keyper_process_validates_journals_and_signs() {
         run_keyper_sign_lock(
             env!("CARGO_BIN_EXE_kageb"),
             directory.path(),
-            1,
+            &dealer.share(package.epoch_account(), 1),
             package.configuration.keypers[1],
             &conflicting,
         ),
@@ -596,7 +629,7 @@ fn one_shot_keyper_process_validates_journals_and_signs() {
 #[test]
 fn initialized_keyper_fails_closed_when_either_journal_file_is_missing() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
 
     for missing in ["keyper-locks.bin", "keyper-locks.initialized"] {
@@ -607,7 +640,7 @@ fn initialized_keyper_fails_closed_when_either_journal_file_is_missing() {
         run_keyper_sign_lock(
             env!("CARGO_BIN_EXE_kageb"),
             directory.path(),
-            0,
+            &dealer.share(package.epoch_account(), 0),
             package.configuration.keypers[0],
             &package,
         )
@@ -617,7 +650,7 @@ fn initialized_keyper_fails_closed_when_either_journal_file_is_missing() {
             run_keyper_sign_lock(
                 env!("CARGO_BIN_EXE_kageb"),
                 directory.path(),
-                0,
+                &dealer.share(package.epoch_account(), 0),
                 package.configuration.keypers[0],
                 &package,
             ),
@@ -629,7 +662,7 @@ fn initialized_keyper_fails_closed_when_either_journal_file_is_missing() {
 #[test]
 fn keyper_rejects_bad_checksum_and_unsupported_journal_version() {
     let _serial = serial_rpc_test();
-    let (package, operator, attesters) = valid_package();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let confirmed = rpc.confirmed_open_epoch(package.epoch_account());
 
@@ -638,7 +671,13 @@ fn keyper_rejects_bad_checksum_and_unsupported_journal_version() {
         let path = directory.path().join("locks.bin");
         let mut keyper =
             ReferenceKeyper::new(0, attesters[0].clone(), LockJournal::open(&path).unwrap());
-        keyper.sign_lock(&package, &confirmed).unwrap();
+        keyper
+            .sign_lock(
+                &package,
+                &confirmed,
+                &dealer.share(package.epoch_account(), 0),
+            )
+            .unwrap();
         let mut bytes = fs::read(&path).unwrap();
         if corrupt == "checksum" {
             let last = bytes.len() - 1;
@@ -667,7 +706,7 @@ fn stale_lock_inode_does_not_strand_the_journal_after_a_crash() {
 #[test]
 fn one_shot_keyper_requires_its_own_rpc_configuration_before_journaling() {
     let _serial = serial_rpc_test();
-    let (package, _operator, _attesters) = valid_package();
+    let (package, _operator, _attesters, dealer, _intents) = valid_package();
     let directory = tempdir().unwrap();
     #[cfg(unix)]
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -676,7 +715,7 @@ fn one_shot_keyper_requires_its_own_rpc_configuration_before_journaling() {
         run_keyper_sign_lock(
             env!("CARGO_BIN_EXE_kageb"),
             directory.path(),
-            0,
+            &dealer.share(package.epoch_account(), 0),
             package.configuration.keypers[0],
             &package,
         ),
@@ -688,7 +727,7 @@ fn one_shot_keyper_requires_its_own_rpc_configuration_before_journaling() {
 #[test]
 fn one_shot_keyper_requires_its_own_attestation_key_before_journaling() {
     let _serial = serial_rpc_test();
-    let (package, operator, _attesters) = valid_package();
+    let (package, operator, _attesters, dealer, _intents) = valid_package();
     let rpc = mock_rpc(&package, &operator);
     let directory = tempdir().unwrap();
     #[cfg(unix)]
@@ -699,7 +738,7 @@ fn one_shot_keyper_requires_its_own_attestation_key_before_journaling() {
         run_keyper_sign_lock(
             env!("CARGO_BIN_EXE_kageb"),
             directory.path(),
-            0,
+            &dealer.share(package.epoch_account(), 0),
             package.configuration.keypers[0],
             &package,
         ),
@@ -711,7 +750,7 @@ fn one_shot_keyper_requires_its_own_attestation_key_before_journaling() {
 #[test]
 fn confirmed_lock_is_created_only_from_a_confirmed_rpc_read_of_the_locked_epoch() {
     let _serial = serial_rpc_test();
-    let (package, operator, _attesters) = valid_package();
+    let (package, operator, _attesters, _dealer, _intents) = valid_package();
     let locked_rpc = MockRpc::start_with(&package, &operator, 800, true);
     let confirmed = ProgramClient::new(&locked_rpc.url)
         .fetch_confirmed_lock(package.epoch_account())
@@ -727,9 +766,355 @@ fn confirmed_lock_is_created_only_from_a_confirmed_rpc_read_of_the_locked_epoch(
 }
 
 #[test]
+fn keyper_releases_only_the_exact_frozen_member_after_its_own_confirmed_rpc_read() {
+    let _serial = serial_rpc_test();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
+    let open_rpc = MockRpc::start_with(&package, &operator, 800, false);
+    let confirmed_open = open_rpc.confirmed_open_epoch(package.epoch_account());
+    let directory = tempdir().unwrap();
+    let mut keyper = ReferenceKeyper::new(
+        0,
+        attesters[0].clone(),
+        LockJournal::open(directory.path().join("locks.bin")).unwrap(),
+    );
+    let secret = dealer.share(package.epoch_account(), 0);
+    keyper
+        .sign_lock(&package, &confirmed_open, &secret)
+        .unwrap();
+    let locked_rpc = MockRpc::start_with(&package, &operator, 800, true);
+    let confirmed_lock = ProgramClient::new(&locked_rpc.url)
+        .fetch_confirmed_lock(package.epoch_account())
+        .unwrap();
+
+    let released = keyper
+        .release_share(&package, &confirmed_lock, &secret, 0)
+        .unwrap();
+    assert_eq!(released.index(), 0);
+    assert_eq!(released.epoch_account(), package.epoch_account());
+    assert_eq!(released.lock_digest(), package.lock_payload().digest());
+    assert!(released.verify(dealer.public_keys(), &package.submissions[0]));
+
+    let mut changed_package = package.clone();
+    changed_package.submissions[0] =
+        submission(99, package.configuration.epoch_id, &dealer, &operator);
+    assert!(keyper
+        .release_share(&changed_package, &confirmed_lock, &secret, 0)
+        .is_err());
+
+    let mut duplicate_ciphertext = package.clone();
+    duplicate_ciphertext.submissions[1] = duplicate_ciphertext.submissions[0].clone();
+    assert!(keyper
+        .release_share(&duplicate_ciphertext, &confirmed_lock, &secret, 1)
+        .is_err());
+
+    let unjournaled = ReferenceKeyper::new(
+        0,
+        attesters[0].clone(),
+        LockJournal::open(directory.path().join("other-locks.bin")).unwrap(),
+    );
+    assert!(unjournaled
+        .release_share(&package, &confirmed_lock, &secret, 0)
+        .is_err());
+}
+
+#[test]
+fn one_shot_keypers_accept_private_shares_only_on_stdin_and_need_two_shares() {
+    let _serial = serial_rpc_test();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
+    let open_rpc = MockRpc::start_with(&package, &operator, 800, false);
+    let locked_rpc = MockRpc::start_with(&package, &operator, 800, true);
+    let directories = [tempdir().unwrap(), tempdir().unwrap()];
+    let mut released = Vec::new();
+
+    for (index, attester) in attesters.iter().enumerate().take(2) {
+        #[cfg(unix)]
+        fs::set_permissions(directories[index].path(), fs::Permissions::from_mode(0o700)).unwrap();
+        open_rpc.configure_keyper(directories[index].path(), attester);
+        let share = dealer.share(package.epoch_account(), index);
+        run_keyper_sign_lock(
+            env!("CARGO_BIN_EXE_kageb"),
+            directories[index].path(),
+            &share,
+            package.configuration.keypers[index],
+            &package,
+        )
+        .unwrap();
+        locked_rpc.configure_rpc(directories[index].path());
+        released.push(
+            run_keyper_release_share(
+                env!("CARGO_BIN_EXE_kageb"),
+                directories[index].path(),
+                &share,
+                &package,
+                0,
+            )
+            .unwrap(),
+        );
+    }
+
+    assert_eq!(
+        dealer
+            .public_keys()
+            .recover_submission(&package.submissions[0], [&released[0]]),
+        Err(CryptoError::InsufficientShares)
+    );
+    let recovered = dealer
+        .public_keys()
+        .recover_submission(&package.submissions[0], [&released[0], &released[1]])
+        .unwrap();
+    assert!(recovered
+        .verify(
+            &key(1).verifying_key(),
+            package.configuration.epoch_id,
+            [1; 32]
+        )
+        .is_ok());
+
+    let wrong_epoch_directory = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        wrong_epoch_directory.path(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    locked_rpc.configure_keyper(wrong_epoch_directory.path(), &attesters[0]);
+    let wrong_epoch_share = dealer.share(Pubkey::new_unique(), 0);
+    assert!(matches!(
+        run_keyper_release_share(
+            env!("CARGO_BIN_EXE_kageb"),
+            wrong_epoch_directory.path(),
+            &wrong_epoch_share,
+            &package,
+            0,
+        ),
+        Err(KeyperProcessError::ChildFailed)
+    ));
+
+    let wrong_dealer_directory = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(
+        wrong_dealer_directory.path(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    open_rpc.configure_keyper(wrong_dealer_directory.path(), &attesters[0]);
+    let wrong_dealer = EpochDealer::random().unwrap();
+    assert!(matches!(
+        run_keyper_sign_lock(
+            env!("CARGO_BIN_EXE_kageb"),
+            wrong_dealer_directory.path(),
+            &wrong_dealer.share(package.epoch_account(), 0),
+            package.configuration.keypers[0],
+            &package,
+        ),
+        Err(KeyperProcessError::ChildFailed)
+    ));
+}
+
+#[test]
+fn keyper_recomputes_the_full_private_ledger_before_settlement_approval() {
+    let _serial = serial_rpc_test();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
+    let open_rpc = MockRpc::start_with(&package, &operator, 800, false);
+    let confirmed_open = open_rpc.confirmed_open_epoch(package.epoch_account());
+    let directory0 = tempdir().unwrap();
+    let directory1 = tempdir().unwrap();
+    let mut keyper = ReferenceKeyper::new(
+        0,
+        attesters[0].clone(),
+        LockJournal::open(directory0.path().join("locks.bin")).unwrap(),
+    );
+    let mut keyper1 = ReferenceKeyper::new(
+        1,
+        attesters[1].clone(),
+        LockJournal::open(directory1.path().join("locks.bin")).unwrap(),
+    );
+    let secret0 = dealer.share(package.epoch_account(), 0);
+    let secret1 = dealer.share(package.epoch_account(), 1);
+    keyper
+        .sign_lock(&package, &confirmed_open, &secret0)
+        .unwrap();
+    keyper1
+        .sign_lock(&package, &confirmed_open, &secret1)
+        .unwrap();
+    let locked_rpc = MockRpc::start_with(&package, &operator, 800, true);
+    let confirmed_lock = ProgramClient::new(&locked_rpc.url)
+        .fetch_confirmed_lock(package.epoch_account())
+        .unwrap();
+
+    let evidence: Vec<_> = (0..package.submissions.len())
+        .map(|member_index| {
+            DecryptionEvidenceV1::new(
+                keyper
+                    .release_share(&package, &confirmed_lock, &secret0, member_index)
+                    .unwrap(),
+                keyper1
+                    .release_share(&package, &confirmed_lock, &secret1, member_index)
+                    .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let alternate = SignedIntentV1::sign(
+        IntentBodyV1::new(
+            Side::Buy,
+            1,
+            101,
+            package.configuration.epoch_id,
+            [1; 32],
+            [99; 16],
+        )
+        .unwrap(),
+        &key(1),
+    );
+    let (authorization, _, _, _) = package.submissions[0].clone().into_wire_parts();
+    let mut substituted = package.clone();
+    substituted.submissions[0] = EncryptedSubmissionV1::sign(
+        authorization,
+        dealer.public_keys().encrypt(&alternate).unwrap(),
+        [21; 32],
+        &key(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        SettlementRequestV1::build(substituted, evidence.clone(), [80; 32], &confirmed_lock),
+        Err(kageb::SettlementValidationError::InvalidLock)
+            | Err(kageb::SettlementValidationError::InvalidBatch)
+    ));
+
+    let request =
+        SettlementRequestV1::build(package.clone(), evidence, [81; 32], &confirmed_lock).unwrap();
+
+    assert_eq!(format!("{request:?}"), "SettlementRequestV1(..redacted)");
+    assert_eq!(
+        format!("{:?}", request.post_balances[0]),
+        "SettlementBalanceV1(..redacted)"
+    );
+    assert_eq!(
+        format!("{:?}", package.balances[0]),
+        "BalanceRecordV1(..redacted)"
+    );
+
+    let approval = keyper
+        .sign_settlement(&request, &confirmed_lock, &secret0)
+        .unwrap();
+    assert!(approval.verify());
+    assert_eq!(approval.digest(), request.settlement_digest);
+    assert_eq!(approval.payload().residual_side, 1);
+    assert_eq!(approval.payload().residual_lots, 4);
+
+    let rejects = |candidate: &SettlementRequestV1| {
+        keyper.sign_settlement(candidate, &confirmed_lock, &secret0)
+    };
+
+    let mut false_pre_root = request.clone();
+    false_pre_root.pre_balance_root[0] ^= 1;
+    assert!(rejects(&false_pre_root).is_err());
+
+    let mut false_post_root = request.clone();
+    false_post_root.post_balance_root[0] ^= 1;
+    assert!(rejects(&false_post_root).is_err());
+
+    let mut non_conserving = request.clone();
+    non_conserving.post_balances[0].base_atoms += 1;
+    assert!(rejects(&non_conserving).is_err());
+
+    let mut omitted_member = request.clone();
+    omitted_member.decryption_evidence.pop();
+    assert!(rejects(&omitted_member).is_err());
+
+    let mut wrong_residual = request.clone();
+    wrong_residual.residual = Residual::Sell { lots: 1 };
+    assert!(rejects(&wrong_residual).is_err());
+
+    let mut wrong_digest = request.clone();
+    wrong_digest.settlement_digest[0] ^= 1;
+    assert!(rejects(&wrong_digest).is_err());
+
+    let mut mismatched_lock = request.clone();
+    mismatched_lock.package.lock_nonce[0] ^= 1;
+    assert!(rejects(&mismatched_lock).is_err());
+}
+
+#[test]
+fn two_one_shot_keypers_fetch_confirmed_lock_and_sign_one_recomputed_settlement() {
+    let _serial = serial_rpc_test();
+    let (package, operator, attesters, dealer, _intents) = valid_package();
+    let open_rpc = MockRpc::start_with(&package, &operator, 800, false);
+    let locked_rpc = MockRpc::start_with(&package, &operator, 800, true);
+    let confirmed_lock = ProgramClient::new(&locked_rpc.url)
+        .fetch_confirmed_lock(package.epoch_account())
+        .unwrap();
+    let directories = [tempdir().unwrap(), tempdir().unwrap()];
+    let shares = [
+        dealer.share(package.epoch_account(), 0),
+        dealer.share(package.epoch_account(), 1),
+    ];
+
+    for (index, attester) in attesters.iter().enumerate().take(2) {
+        #[cfg(unix)]
+        fs::set_permissions(directories[index].path(), fs::Permissions::from_mode(0o700)).unwrap();
+        open_rpc.configure_keyper(directories[index].path(), attester);
+        run_keyper_sign_lock(
+            env!("CARGO_BIN_EXE_kageb"),
+            directories[index].path(),
+            &shares[index],
+            package.configuration.keypers[index],
+            &package,
+        )
+        .unwrap();
+        locked_rpc.configure_rpc(directories[index].path());
+    }
+
+    let evidence: Vec<_> = (0..package.submissions.len())
+        .map(|member_index| {
+            DecryptionEvidenceV1::new(
+                run_keyper_release_share(
+                    env!("CARGO_BIN_EXE_kageb"),
+                    directories[0].path(),
+                    &shares[0],
+                    &package,
+                    member_index,
+                )
+                .unwrap(),
+                run_keyper_release_share(
+                    env!("CARGO_BIN_EXE_kageb"),
+                    directories[1].path(),
+                    &shares[1],
+                    &package,
+                    member_index,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let request =
+        SettlementRequestV1::build(package.clone(), evidence, [82; 32], &confirmed_lock).unwrap();
+    let mut approvals = Vec::new();
+    for index in 0..2 {
+        approvals.push(
+            run_keyper_sign_settlement(
+                env!("CARGO_BIN_EXE_kageb"),
+                directories[index].path(),
+                &shares[index],
+                package.configuration.keypers[index],
+                &request,
+            )
+            .unwrap(),
+        );
+    }
+
+    assert!(approvals.iter().all(|approval| approval.verify()));
+    assert_eq!(approvals[0].digest(), approvals[1].digest());
+    assert_eq!(approvals[0].payload(), approvals[1].payload());
+}
+
+#[test]
 fn confirmed_open_epoch_rejects_the_exact_lock_deadline() {
     let _serial = serial_rpc_test();
-    let (package, operator, _attesters) = valid_package();
+    let (package, operator, _attesters, _dealer, _intents) = valid_package();
     let rpc = MockRpc::start_with(
         &package,
         &operator,
@@ -745,14 +1130,14 @@ fn confirmed_open_epoch_rejects_the_exact_lock_deadline() {
 #[test]
 fn one_shot_keyper_rejects_a_group_readable_working_directory() {
     let _serial = serial_rpc_test();
-    let (package, _operator, _attesters) = valid_package();
+    let (package, _operator, _attesters, dealer, _intents) = valid_package();
     let directory = tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750)).unwrap();
     assert_eq!(
         run_keyper_sign_lock(
             env!("CARGO_BIN_EXE_kageb"),
             directory.path(),
-            0,
+            &dealer.share(package.epoch_account(), 0),
             package.configuration.keypers[0],
             &package,
         ),

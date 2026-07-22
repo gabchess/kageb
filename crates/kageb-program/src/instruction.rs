@@ -31,9 +31,28 @@ pub enum KagebInstruction {
     InitializePool(InitializePoolArgs),
     CreateEpoch(CreateEpochArgs),
     Lock(LockPayloadV1),
-    Settle(SettlementPayloadV1),
+    Settle(CompactSettlementPayload),
     Expire,
     Abort,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactSettlementPayload {
+    pub result_commitment: [u8; 32],
+    pub residual_side: u8,
+    pub residual_lots: u32,
+    pub settlement_nonce: [u8; 32],
+}
+
+impl From<SettlementPayloadV1> for CompactSettlementPayload {
+    fn from(payload: SettlementPayloadV1) -> Self {
+        Self {
+            result_commitment: payload.result_commitment,
+            residual_side: payload.residual_side,
+            residual_lots: payload.residual_lots,
+            settlement_nonce: payload.settlement_nonce,
+        }
+    }
 }
 
 impl KagebInstruction {
@@ -68,12 +87,7 @@ impl KagebInstruction {
                 out.extend_from_slice(&payload.encode());
                 out
             }
-            Self::Settle(payload) => {
-                let mut out = Vec::with_capacity(1 + SettlementPayloadV1::ENCODED_LEN);
-                out.push(3);
-                out.extend_from_slice(&payload.encode());
-                out
-            }
+            Self::Settle(payload) => encode_settlement(payload),
             Self::Expire => vec![4],
             Self::Abort => vec![5],
         }
@@ -116,16 +130,27 @@ impl KagebInstruction {
                     .map(Self::Lock)
                     .ok_or_else(invalid)
             }
-            Some(3) if data.len() == 1 + SettlementPayloadV1::ENCODED_LEN => {
-                SettlementPayloadV1::decode(&data[1..])
-                    .map(Self::Settle)
-                    .ok_or_else(invalid)
-            }
+            Some(3) if data.len() == 70 => Ok(Self::Settle(CompactSettlementPayload {
+                result_commitment: data[1..33].try_into().map_err(|_| invalid())?,
+                residual_side: data[33],
+                residual_lots: u32::from_le_bytes(data[34..38].try_into().map_err(|_| invalid())?),
+                settlement_nonce: data[38..70].try_into().map_err(|_| invalid())?,
+            })),
             Some(4) if data.len() == 1 => Ok(Self::Expire),
             Some(5) if data.len() == 1 => Ok(Self::Abort),
             _ => Err(invalid()),
         }
     }
+}
+
+fn encode_settlement(payload: CompactSettlementPayload) -> Vec<u8> {
+    let mut out = vec![0_u8; 70];
+    out[0] = 3;
+    out[1..33].copy_from_slice(&payload.result_commitment);
+    out[33] = payload.residual_side;
+    out[34..38].copy_from_slice(&payload.residual_lots.to_le_bytes());
+    out[38..70].copy_from_slice(&payload.settlement_nonce);
+    out
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,7 +267,7 @@ pub fn settle_instruction(accounts: SettleAccounts, payload: SettlementPayloadV1
             AccountMeta::new_readonly(solana_sdk_ids::sysvar::instructions::ID, false),
             AccountMeta::new_readonly(solana_sdk_ids::sysvar::clock::ID, false),
         ],
-        data: KagebInstruction::Settle(payload).encode(),
+        data: KagebInstruction::Settle(payload.into()).encode(),
     }
 }
 

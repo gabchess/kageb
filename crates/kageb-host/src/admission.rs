@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -10,14 +10,17 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use crate::PoolBalance;
+use crate::{crypto::FundedAuthorizationV1, PoolBalance};
 
 const HEADER: [u8; 8] = *b"KGBRSV1\0";
 const RECORD_LEN: usize = 81;
 const CHECKSUM_LEN: usize = 32;
 const LOCK_ATTEMPTS: usize = 100;
+const SUSPENSION_HEADER: [u8; 8] = *b"KGBSUS1\0";
+const TRADING_KEY_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -184,7 +187,7 @@ pub struct ReservationJournal {
 impl ReservationJournal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
-        let _lock = FileLock::acquire(&path)?;
+        let _lock = acquire_journal_lock(&path)?;
         if !path.exists() {
             persist_records(&path, &BTreeMap::new())?;
         }
@@ -264,7 +267,7 @@ impl ReservationJournal {
         &mut self,
         operation: impl FnOnce(&mut BTreeMap<[u8; 32], ReservationRecord>) -> Result<(), JournalError>,
     ) -> Result<(), JournalError> {
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = acquire_journal_lock(&self.path)?;
         let mut current = load_records(&self.path)?;
         operation(&mut current)?;
         persist_records(&self.path, &current)?;
@@ -273,35 +276,14 @@ impl ReservationJournal {
     }
 }
 
-struct FileLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl FileLock {
-    fn acquire(journal_path: &Path) -> Result<Self, JournalError> {
-        let path = journal_path.with_extension("lock");
-        for _ in 0..LOCK_ATTEMPTS {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            match options.open(&path) {
-                Ok(file) => return Ok(Self { path, _file: file }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => return Err(error.into()),
-            }
+fn acquire_journal_lock(journal_path: &Path) -> Result<AdvisoryLock, JournalError> {
+    AdvisoryLock::acquire(&journal_path.with_extension("lock")).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            JournalError::Busy
+        } else {
+            error.into()
         }
-        Err(JournalError::Busy)
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    })
 }
 
 fn load_records(path: &Path) -> Result<BTreeMap<[u8; 32], ReservationRecord>, JournalError> {
@@ -379,4 +361,187 @@ fn persist_records(
 fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuspensionError {
+    Io(io::ErrorKind),
+    Busy,
+    Corrupt,
+    Suspended,
+    Capacity,
+}
+
+impl From<io::Error> for SuspensionError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
+
+/// Durable denylist consulted by the supported funded-authorization issuer.
+#[derive(Debug)]
+pub struct SuspensionRegistry {
+    path: PathBuf,
+    trading_keys: BTreeSet<[u8; TRADING_KEY_LEN]>,
+}
+
+impl SuspensionRegistry {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SuspensionError> {
+        let path = path.as_ref().to_path_buf();
+        let _lock = acquire_suspension_lock(&path)?;
+        if !path.exists() {
+            persist_suspensions(&path, &BTreeSet::new())?;
+        }
+        let trading_keys = load_suspensions(&path)?;
+        Ok(Self { path, trading_keys })
+    }
+
+    pub fn suspend(&mut self, trading_key: [u8; TRADING_KEY_LEN]) -> Result<(), SuspensionError> {
+        let _lock = acquire_suspension_lock(&self.path)?;
+        let mut current = load_suspensions(&self.path)?;
+        current.insert(trading_key);
+        persist_suspensions(&self.path, &current)?;
+        self.trading_keys = current;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_suspended(&self, trading_key: [u8; TRADING_KEY_LEN]) -> bool {
+        self.trading_keys.contains(&trading_key)
+    }
+
+    pub fn issue_authorization(
+        &self,
+        reserved: UnsignedFundedAuthorizationV1,
+        epoch_id: [u8; 32],
+        trading_key: VerifyingKey,
+        operator: &SigningKey,
+        expiry_slot: u64,
+    ) -> Result<FundedAuthorizationV1, SuspensionError> {
+        let _lock = acquire_suspension_lock(&self.path)?;
+        if load_suspensions(&self.path)?.contains(&trading_key.to_bytes()) {
+            return Err(SuspensionError::Suspended);
+        }
+        Ok(FundedAuthorizationV1::sign(
+            reserved,
+            epoch_id,
+            trading_key,
+            operator,
+            expiry_slot,
+        ))
+    }
+}
+
+fn acquire_suspension_lock(registry_path: &Path) -> Result<AdvisoryLock, SuspensionError> {
+    AdvisoryLock::acquire(&registry_path.with_extension("suspension-lock")).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            SuspensionError::Busy
+        } else {
+            error.into()
+        }
+    })
+}
+
+struct AdvisoryLock {
+    file: File,
+}
+
+impl AdvisoryLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
+        for _ in 0..LOCK_ATTEMPTS {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) => {
+                    let error: io::Error = error.into();
+                    if error.kind() != io::ErrorKind::WouldBlock {
+                        return Err(error);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "advisory lock remained busy",
+        ))
+    }
+}
+
+impl Drop for AdvisoryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn load_suspensions(path: &Path) -> Result<BTreeSet<[u8; TRADING_KEY_LEN]>, SuspensionError> {
+    let bytes = fs::read(path)?;
+    let minimum = SUSPENSION_HEADER.len() + 4 + CHECKSUM_LEN;
+    if bytes.len() < minimum || bytes[..SUSPENSION_HEADER.len()] != SUSPENSION_HEADER {
+        return Err(SuspensionError::Corrupt);
+    }
+    let payload_len = bytes.len() - CHECKSUM_LEN;
+    if Sha256::digest(&bytes[..payload_len]).as_slice() != &bytes[payload_len..] {
+        return Err(SuspensionError::Corrupt);
+    }
+    let count = u32::from_le_bytes(
+        bytes[SUSPENSION_HEADER.len()..SUSPENSION_HEADER.len() + 4]
+            .try_into()
+            .map_err(|_| SuspensionError::Corrupt)?,
+    ) as usize;
+    let expected_len = SUSPENSION_HEADER
+        .len()
+        .checked_add(4)
+        .and_then(|length| length.checked_add(count.checked_mul(TRADING_KEY_LEN)?))
+        .and_then(|length| length.checked_add(CHECKSUM_LEN))
+        .ok_or(SuspensionError::Corrupt)?;
+    if bytes.len() != expected_len {
+        return Err(SuspensionError::Corrupt);
+    }
+    let mut trading_keys = BTreeSet::new();
+    for encoded in bytes[SUSPENSION_HEADER.len() + 4..payload_len].chunks_exact(TRADING_KEY_LEN) {
+        let trading_key = encoded.try_into().map_err(|_| SuspensionError::Corrupt)?;
+        if !trading_keys.insert(trading_key) {
+            return Err(SuspensionError::Corrupt);
+        }
+    }
+    Ok(trading_keys)
+}
+
+fn persist_suspensions(
+    path: &Path,
+    trading_keys: &BTreeSet<[u8; TRADING_KEY_LEN]>,
+) -> Result<(), SuspensionError> {
+    let count = u32::try_from(trading_keys.len()).map_err(|_| SuspensionError::Capacity)?;
+    let mut bytes = Vec::with_capacity(
+        SUSPENSION_HEADER.len() + 4 + trading_keys.len() * TRADING_KEY_LEN + CHECKSUM_LEN,
+    );
+    bytes.extend_from_slice(&SUSPENSION_HEADER);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for trading_key in trading_keys {
+        bytes.extend_from_slice(trading_key);
+    }
+    bytes.extend_from_slice(&Sha256::digest(&bytes));
+
+    let temporary = path.with_extension(format!("suspension-tmp.{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = (|| -> io::Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        sync_parent(path)?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }

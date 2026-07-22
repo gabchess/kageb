@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 use bincode::Options;
@@ -21,11 +21,17 @@ use ed25519_dalek::SigningKey;
 const REQUEST_VERSION: u8 = 1;
 const REQUEST_LEN: usize = 73;
 const RESPONSE_LEN: usize = 1 + 8 + PK_SIZE + SIG_SIZE;
-const SIGN_LOCK_PREFIX_LEN: usize = 13;
+const BOUND_SHARE_LEN: usize = 73;
+const SIGN_LOCK_PREFIX_LEN: usize = BOUND_SHARE_LEN + 4;
 const SIGN_LOCK_RESPONSE_LEN: usize = 129;
 const MAX_SIGN_LOCK_REQUEST_LEN: usize = 64 * 1024;
 const KEYPER_RPC_CONFIG: &str = "keyper-rpc-url";
 const KEYPER_ATTESTATION_KEY: &str = "keyper-attestation-key";
+const RELEASE_PREFIX_LEN: usize = BOUND_SHARE_LEN + 8;
+const MAX_RELEASE_REQUEST_LEN: usize = 64 * 1024;
+const MAX_SETTLEMENT_REQUEST_LEN: usize = 128 * 1024;
+const MAX_SETTLEMENT_FRAME_LEN: usize = BOUND_SHARE_LEN + MAX_SETTLEMENT_REQUEST_LEN;
+const SETTLEMENT_STDIN_READ_LIMIT: usize = MAX_SETTLEMENT_FRAME_LEN + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyperProcessError {
@@ -150,7 +156,7 @@ pub fn run_keyper_self_test(
 pub fn run_keyper_sign_lock(
     executable: impl AsRef<Path>,
     private_directory: impl AsRef<Path>,
-    index: usize,
+    share: &KeyperSecretShare,
     expected_keyper: Pubkey,
     package: &LockPackageV1,
 ) -> Result<LockApprovalV1, KeyperProcessError> {
@@ -160,33 +166,20 @@ pub fn run_keyper_sign_lock(
         .encode_wire()
         .map_err(|_| KeyperProcessError::Input)?;
     let package_len = u32::try_from(package.len()).map_err(|_| KeyperProcessError::Input)?;
-    let index = u64::try_from(index).map_err(|_| KeyperProcessError::Input)?;
     let mut encoded = Zeroizing::new(Vec::with_capacity(SIGN_LOCK_PREFIX_LEN + package.len()));
-    encoded.push(REQUEST_VERSION);
-    encoded.extend_from_slice(&index.to_le_bytes());
+    let secret_bytes = append_bound_share(&mut encoded, share)?;
     encoded.extend_from_slice(&package_len.to_le_bytes());
     encoded.extend_from_slice(&package);
     if encoded.len() > MAX_SIGN_LOCK_REQUEST_LEN {
         return Err(KeyperProcessError::Input);
     }
-    let mut child = Command::new(executable.as_ref())
-        .args(["keyper", "sign-lock"])
-        .env_clear()
-        .current_dir(private_directory.as_ref())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| KeyperProcessError::Spawn)?;
-    let mut stdin = child.stdin.take().ok_or(KeyperProcessError::Spawn)?;
-    stdin
-        .write_all(&encoded)
-        .and_then(|()| stdin.flush())
-        .map_err(|_| KeyperProcessError::Input)?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(|_| KeyperProcessError::ChildFailed)?;
+    let output = run_one_shot(
+        executable.as_ref(),
+        private_directory.as_ref(),
+        "sign-lock",
+        &encoded,
+        &secret_bytes,
+    )?;
     if !output.status.success() {
         return Err(KeyperProcessError::ChildFailed);
     }
@@ -209,6 +202,216 @@ pub fn run_keyper_sign_lock(
     }
     validate_lock_approval(expected_keyper, expected_digest, &approval)?;
     Ok(approval)
+}
+
+pub fn run_keyper_release_share(
+    executable: impl AsRef<Path>,
+    private_directory: impl AsRef<Path>,
+    share: &KeyperSecretShare,
+    package: &LockPackageV1,
+    member_index: usize,
+) -> Result<crate::ReleasedShareV1, KeyperProcessError> {
+    verify_private_directory(private_directory.as_ref())?;
+    let package_bytes = package
+        .encode_wire()
+        .map_err(|_| KeyperProcessError::Input)?;
+    let mut encoded = Zeroizing::new(Vec::with_capacity(RELEASE_PREFIX_LEN + package_bytes.len()));
+    let secret_bytes = append_bound_share(&mut encoded, share)?;
+    encoded.extend_from_slice(
+        &u32::try_from(member_index)
+            .map_err(|_| KeyperProcessError::Input)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(
+        &u32::try_from(package_bytes.len())
+            .map_err(|_| KeyperProcessError::Input)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&package_bytes);
+    if encoded.len() > MAX_RELEASE_REQUEST_LEN {
+        return Err(KeyperProcessError::Input);
+    }
+    let output = run_one_shot(
+        executable.as_ref(),
+        private_directory.as_ref(),
+        "release-share",
+        &encoded,
+        &secret_bytes,
+    )?;
+    if !output.status.success() {
+        return Err(KeyperProcessError::ChildFailed);
+    }
+    if !output.stderr.is_empty() {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    let released = crate::ReleasedShareV1::decode_wire(&output.stdout)
+        .map_err(|_| KeyperProcessError::InvalidResponse)?;
+    let submission = package
+        .submissions
+        .get(member_index)
+        .ok_or(KeyperProcessError::Input)?;
+    if released.index() != share.index()
+        || released.epoch_account() != package.epoch_account()
+        || released.lock_digest() != package.lock_payload().digest()
+        || !released.verify(&package.epoch_public_keys, submission)
+    {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    Ok(released)
+}
+
+pub fn run_keyper_sign_settlement(
+    executable: impl AsRef<Path>,
+    private_directory: impl AsRef<Path>,
+    share: &KeyperSecretShare,
+    expected_keyper: Pubkey,
+    request: &crate::SettlementRequestV1,
+) -> Result<crate::SettlementApprovalV1, KeyperProcessError> {
+    verify_private_directory(private_directory.as_ref())?;
+    let request_bytes = request
+        .encode_wire()
+        .map_err(|_| KeyperProcessError::Input)?;
+    if request_bytes.len() > MAX_SETTLEMENT_REQUEST_LEN {
+        return Err(KeyperProcessError::Input);
+    }
+    let mut encoded = Zeroizing::new(Vec::with_capacity(BOUND_SHARE_LEN + request_bytes.len()));
+    let secret_bytes = append_bound_share(&mut encoded, share)?;
+    encoded.extend_from_slice(&request_bytes);
+    if encoded.len() > MAX_SETTLEMENT_FRAME_LEN {
+        return Err(KeyperProcessError::Input);
+    }
+    let output = run_one_shot(
+        executable.as_ref(),
+        private_directory.as_ref(),
+        "sign-settlement",
+        &encoded,
+        &secret_bytes,
+    )?;
+    if !output.status.success() {
+        return Err(KeyperProcessError::ChildFailed);
+    }
+    if !output.stderr.is_empty() {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    let approval = crate::SettlementApprovalV1::decode_wire(&output.stdout)
+        .map_err(|_| KeyperProcessError::InvalidResponse)?;
+    if approval.keyper_key() != expected_keyper.to_bytes()
+        || approval.digest() != request.settlement_digest
+        || !approval.verify()
+        || share.index() >= 3
+    {
+        return Err(KeyperProcessError::InvalidResponse);
+    }
+    Ok(approval)
+}
+
+fn append_bound_share(
+    encoded: &mut Vec<u8>,
+    share: &KeyperSecretShare,
+) -> Result<Zeroizing<Vec<u8>>, KeyperProcessError> {
+    let secret_bytes = Zeroizing::new(
+        codec()
+            .serialize(&SerdeSecret(share.secret()))
+            .map_err(|_| KeyperProcessError::Input)?,
+    );
+    encoded.push(REQUEST_VERSION);
+    encoded.extend_from_slice(share.epoch_account().as_ref());
+    encoded.extend_from_slice(
+        &u64::try_from(share.index())
+            .map_err(|_| KeyperProcessError::Input)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&secret_bytes);
+    if encoded.len() != BOUND_SHARE_LEN {
+        return Err(KeyperProcessError::Input);
+    }
+    Ok(secret_bytes)
+}
+
+fn decode_bound_share(encoded: &[u8]) -> Result<KeyperSecretShare, KeyperProcessError> {
+    if encoded.len() != BOUND_SHARE_LEN || encoded[0] != REQUEST_VERSION {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let epoch_account = Pubkey::new_from_array(
+        encoded[1..33]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    );
+    let index = usize::try_from(u64::from_le_bytes(
+        encoded[33..41]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    ))
+    .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let secret: SerdeSecret<SecretKeyShare> = codec()
+        .deserialize(&encoded[41..])
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    Ok(KeyperSecretShare::from_secret(
+        epoch_account,
+        index,
+        secret.into_inner(),
+    ))
+}
+
+fn run_one_shot(
+    executable: &Path,
+    private_directory: &Path,
+    operation: &str,
+    encoded: &[u8],
+    secret_bytes: &[u8],
+) -> Result<Output, KeyperProcessError> {
+    let mut child = Command::new(executable)
+        .args(["keyper", operation])
+        .env_clear()
+        .current_dir(private_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| KeyperProcessError::Spawn)?;
+    let mut stdin = child.stdin.take().ok_or(KeyperProcessError::Spawn)?;
+    stdin
+        .write_all(encoded)
+        .and_then(|()| stdin.flush())
+        .map_err(|_| KeyperProcessError::Input)?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|_| KeyperProcessError::ChildFailed)?;
+    if contains_bytes(executable.as_os_str().as_encoded_bytes(), secret_bytes)
+        || contains_bytes(
+            private_directory.as_os_str().as_encoded_bytes(),
+            secret_bytes,
+        )
+        || contains_bytes(operation.as_bytes(), secret_bytes)
+        || contains_bytes(&output.stdout, secret_bytes)
+        || contains_bytes(&output.stderr, secret_bytes)
+        || directory_contains_bytes(private_directory, secret_bytes)?
+    {
+        return Err(KeyperProcessError::SecretLeak);
+    }
+    Ok(output)
+}
+
+fn directory_contains_bytes(path: &Path, needle: &[u8]) -> Result<bool, KeyperProcessError> {
+    for entry in fs::read_dir(path).map_err(|_| KeyperProcessError::Input)? {
+        let entry = entry.map_err(|_| KeyperProcessError::Input)?;
+        let file_type = entry.file_type().map_err(|_| KeyperProcessError::Input)?;
+        if file_type.is_symlink() {
+            return Err(KeyperProcessError::Input);
+        }
+        if file_type.is_dir() {
+            if directory_contains_bytes(&entry.path(), needle)? {
+                return Ok(true);
+            }
+        } else if file_type.is_file() {
+            let bytes = fs::read(entry.path()).map_err(|_| KeyperProcessError::Input)?;
+            if contains_bytes(&bytes, needle) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn validate_lock_approval(
@@ -268,14 +471,10 @@ pub fn handle_keyper_sign_lock() -> Result<(), KeyperProcessError> {
     if encoded[0] != REQUEST_VERSION {
         return Err(KeyperProcessError::InvalidRequest);
     }
-    let index = usize::try_from(u64::from_le_bytes(
-        encoded[1..9]
-            .try_into()
-            .map_err(|_| KeyperProcessError::InvalidRequest)?,
-    ))
-    .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let secret = decode_bound_share(&encoded[..BOUND_SHARE_LEN])?;
+    let index = secret.index();
     let package_len = u32::from_le_bytes(
-        encoded[9..13]
+        encoded[BOUND_SHARE_LEN..SIGN_LOCK_PREFIX_LEN]
             .try_into()
             .map_err(|_| KeyperProcessError::InvalidRequest)?,
     ) as usize;
@@ -301,7 +500,7 @@ pub fn handle_keyper_sign_lock() -> Result<(), KeyperProcessError> {
         LockJournal::open(journal_path).map_err(|_| KeyperProcessError::InvalidRequest)?;
     let mut keyper = ReferenceKeyper::new(index, signing_key, journal);
     let approval = keyper
-        .sign_lock(&package, &confirmed)
+        .sign_lock(&package, &confirmed, &secret)
         .map_err(|_| KeyperProcessError::InvalidRequest)?;
     let mut response = [0_u8; SIGN_LOCK_RESPONSE_LEN];
     response[0] = REQUEST_VERSION;
@@ -310,6 +509,108 @@ pub fn handle_keyper_sign_lock() -> Result<(), KeyperProcessError> {
     response[65..129].copy_from_slice(&approval.signature());
     io::stdout()
         .write_all(&response)
+        .and_then(|()| io::stdout().flush())
+        .map_err(|_| KeyperProcessError::InvalidResponse)
+}
+
+#[doc(hidden)]
+pub fn handle_keyper_release_share() -> Result<(), KeyperProcessError> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(MAX_RELEASE_REQUEST_LEN + 1));
+    io::stdin()
+        .take((MAX_RELEASE_REQUEST_LEN + 1) as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if encoded.len() < RELEASE_PREFIX_LEN
+        || encoded.len() > MAX_RELEASE_REQUEST_LEN
+        || encoded[0] != REQUEST_VERSION
+    {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let secret = decode_bound_share(&encoded[..BOUND_SHARE_LEN])?;
+    let index = secret.index();
+    let member_index = u32::from_le_bytes(
+        encoded[BOUND_SHARE_LEN..BOUND_SHARE_LEN + 4]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    ) as usize;
+    let package_len = u32::from_le_bytes(
+        encoded[BOUND_SHARE_LEN + 4..RELEASE_PREFIX_LEN]
+            .try_into()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?,
+    ) as usize;
+    if RELEASE_PREFIX_LEN.checked_add(package_len) != Some(encoded.len()) {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let package = LockPackageV1::decode_wire(&encoded[RELEASE_PREFIX_LEN..])
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if secret.epoch_account() != package.epoch_account() || secret.index() != index {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let rpc_url = read_keyper_rpc_url()?;
+    let confirmed = ProgramClient::new(rpc_url)
+        .fetch_confirmed_lock(package.epoch_account())
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let signing_seed = read_keyper_attestation_key()?;
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let journal = LockJournal::open(
+        std::env::current_dir()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?
+            .join("keyper-locks.bin"),
+    )
+    .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let keyper = ReferenceKeyper::new(index, signing_key, journal);
+    let released = keyper
+        .release_share(&package, &confirmed, &secret, member_index)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let response = released
+        .encode_wire()
+        .map_err(|_| KeyperProcessError::InvalidResponse)?;
+    io::stdout()
+        .write_all(&response)
+        .and_then(|()| io::stdout().flush())
+        .map_err(|_| KeyperProcessError::InvalidResponse)
+}
+
+#[doc(hidden)]
+pub fn handle_keyper_sign_settlement() -> Result<(), KeyperProcessError> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(SETTLEMENT_STDIN_READ_LIMIT));
+    io::stdin()
+        .take(SETTLEMENT_STDIN_READ_LIMIT as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    if encoded.len() <= BOUND_SHARE_LEN || encoded.len() > MAX_SETTLEMENT_FRAME_LEN {
+        return Err(KeyperProcessError::InvalidRequest);
+    }
+    let secret = decode_bound_share(&encoded[..BOUND_SHARE_LEN])?;
+    let request = crate::SettlementRequestV1::decode_wire(&encoded[BOUND_SHARE_LEN..])
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let rpc_url = read_keyper_rpc_url()?;
+    let confirmed = ProgramClient::new(rpc_url)
+        .fetch_confirmed_lock(request.package.epoch_account())
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let signing_seed = read_keyper_attestation_key()?;
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let journal = LockJournal::open(
+        std::env::current_dir()
+            .map_err(|_| KeyperProcessError::InvalidRequest)?
+            .join("keyper-locks.bin"),
+    )
+    .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    let pool = confirmed
+        .pool
+        .as_ref()
+        .ok_or(KeyperProcessError::InvalidRequest)?;
+    let index = pool
+        .keypers
+        .iter()
+        .position(|key| key.to_bytes() == signing_key.verifying_key().to_bytes())
+        .ok_or(KeyperProcessError::InvalidRequest)?;
+    let keyper = ReferenceKeyper::new(index, signing_key, journal);
+    let approval = keyper
+        .sign_settlement(&request, &confirmed, &secret)
+        .map_err(|_| KeyperProcessError::InvalidRequest)?;
+    io::stdout()
+        .write_all(&approval.encode_wire())
         .and_then(|()| io::stdout().flush())
         .map_err(|_| KeyperProcessError::InvalidResponse)
 }
@@ -442,6 +743,14 @@ mod tests {
                 &approval,
             ),
             Err(KeyperProcessError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn settlement_stdin_limit_includes_the_bound_share_and_oversize_byte() {
+        assert_eq!(
+            SETTLEMENT_STDIN_READ_LIMIT,
+            BOUND_SHARE_LEN + MAX_SETTLEMENT_REQUEST_LEN + 1
         );
     }
 }

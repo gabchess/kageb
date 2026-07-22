@@ -26,7 +26,10 @@ use solana_program::{
 };
 use solana_rpc_client::rpc_client::RpcClient;
 
-use crate::{content_root, AdmissionPolicyV1, CommitmentDomain, EncryptedSubmissionV1};
+use crate::{
+    content_root, AdmissionPolicyV1, CommitmentDomain, EncryptedSubmissionV1, EpochPublicKeys,
+    KeyperSecretShare, ReleasedShareV1,
+};
 
 const SNAPSHOT_DOMAIN: &[u8] = b"KAGEB_BALANCE_SNAPSHOT_V1\0";
 const JOURNAL_HEADER: &[u8; 8] = b"KGBLCK1\0";
@@ -34,6 +37,8 @@ const JOURNAL_INITIALIZED: &[u8; 8] = b"KGBINI1\0";
 const JOURNAL_RECORD_LEN: usize = 64;
 const JOURNAL_CHECKSUM_LEN: usize = 32;
 const LOCK_ATTEMPTS: usize = 100;
+pub const MAX_BATCH_MEMBERS: usize = 64;
+const MAX_EPOCH_PUBLIC_KEYS_LEN: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LockValidationError {
@@ -45,6 +50,7 @@ pub enum LockValidationError {
     DuplicateAuthorization,
     DuplicateReceipt,
     MemberCountMismatch,
+    MemberLimitExceeded,
     CrowdBelowMinimum,
     MemberRootMismatch,
     DeadlinePassed,
@@ -65,13 +71,19 @@ impl From<io::Error> for LockValidationError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct BalanceRecordV1 {
     participant_id: [u8; 32],
     base_atoms: u64,
     quote_atoms: u64,
     reserved_base_atoms: u64,
     reserved_quote_atoms: u64,
+}
+
+impl std::fmt::Debug for BalanceRecordV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BalanceRecordV1(..redacted)")
+    }
 }
 
 impl BalanceRecordV1 {
@@ -138,6 +150,14 @@ impl BalanceRecordV1 {
                     .map_err(|_| LockValidationError::InvalidBalance)?,
             ),
         )
+    }
+
+    pub(crate) const fn participant_id(&self) -> [u8; 32] {
+        self.participant_id
+    }
+
+    pub(crate) const fn pool_balance(&self) -> crate::PoolBalance {
+        crate::PoolBalance::new(self.base_atoms, self.quote_atoms)
     }
 }
 
@@ -242,6 +262,7 @@ impl SignedBalanceSnapshotV1 {
 pub struct LockPackageV1 {
     pub epoch_account: Pubkey,
     pub configuration: EpochConfigurationV1,
+    pub epoch_public_keys: EpochPublicKeys,
     pub submissions: Vec<EncryptedSubmissionV1>,
     pub balances: Vec<BalanceRecordV1>,
     pub balance_snapshot: SignedBalanceSnapshotV1,
@@ -261,18 +282,23 @@ impl LockPackageV1 {
     pub fn new(
         epoch_account: Pubkey,
         configuration: EpochConfigurationV1,
+        epoch_public_keys: EpochPublicKeys,
         submissions: Vec<EncryptedSubmissionV1>,
         balances: Vec<BalanceRecordV1>,
         balance_snapshot: SignedBalanceSnapshotV1,
         lock_nonce: [u8; 32],
     ) -> Result<Self, LockValidationError> {
+        if submissions.len() > MAX_BATCH_MEMBERS || balances.len() > MAX_BATCH_MEMBERS {
+            return Err(LockValidationError::MemberLimitExceeded);
+        }
         let member_count = u32::try_from(submissions.len())
             .map_err(|_| LockValidationError::MemberCountMismatch)?;
-        let member_root = member_root(&submissions)?;
+        let member_root = member_root(&epoch_public_keys, &submissions)?;
         let pre_balance_root = balance_root(&balances)?;
         Ok(Self {
             epoch_account,
             configuration,
+            epoch_public_keys,
             submissions,
             balances,
             balance_snapshot,
@@ -327,6 +353,9 @@ impl LockPackageV1 {
         if confirmed.current_timestamp >= self.configuration.lock_deadline {
             return Err(LockValidationError::DeadlinePassed);
         }
+        if self.submissions.len() > MAX_BATCH_MEMBERS || self.balances.len() > MAX_BATCH_MEMBERS {
+            return Err(LockValidationError::MemberLimitExceeded);
+        }
         if self.member_count as usize != self.submissions.len() {
             return Err(LockValidationError::MemberCountMismatch);
         }
@@ -351,7 +380,7 @@ impl LockPackageV1 {
                 return Err(LockValidationError::DuplicateReceipt);
             }
         }
-        if member_root(&self.submissions)? != self.member_root {
+        if member_root(&self.epoch_public_keys, &self.submissions)? != self.member_root {
             return Err(LockValidationError::MemberRootMismatch);
         }
 
@@ -389,7 +418,70 @@ impl LockPackageV1 {
         Ok(self.lock_payload().digest())
     }
 
+    pub(crate) fn validate_locked(
+        &self,
+        confirmed: &ConfirmedLock,
+    ) -> Result<[u8; 32], LockValidationError> {
+        let pool = confirmed
+            .pool
+            .as_ref()
+            .ok_or(LockValidationError::InvalidOnchainLock)?;
+        let configuration = EpochConfigurationV1 {
+            pool: confirmed.state.pool,
+            epoch_id: confirmed.state.epoch_id,
+            base_mint: pool.base_mint,
+            quote_mint: pool.quote_mint,
+            base_lot_atoms: pool.base_lot_atoms,
+            quote_atoms_per_lot: confirmed.state.quote_atoms_per_lot,
+            minimum_count: confirmed.state.minimum_count,
+            lock_threshold: pool.lock_threshold,
+            settlement_threshold: pool.settlement_threshold,
+            keypers: pool.keypers,
+            lock_deadline: confirmed.state.lock_deadline,
+            abort_deadline: confirmed.state.abort_deadline,
+        };
+        let operator = VerifyingKey::from_bytes(&pool.operator.to_bytes())
+            .map_err(|_| LockValidationError::InvalidOnchainLock)?;
+        let policy = AdmissionPolicyV1::new(
+            configuration.epoch_id,
+            operator,
+            configuration.minimum_count as usize,
+            configuration.base_lot_atoms,
+            configuration.quote_atoms_per_lot,
+            confirmed.confirmation_slot,
+        )
+        .map_err(|_| LockValidationError::InvalidOnchainLock)?;
+        let open = ConfirmedOpenEpoch {
+            epoch_account: confirmed.epoch_account,
+            configuration,
+            policy,
+            current_timestamp: configuration.lock_deadline.saturating_sub(1),
+            confirmation_slot: confirmed.confirmation_slot,
+        };
+        let digest = self.validate(&open)?;
+        if digest != confirmed.state.lock_digest
+            || self.pre_balance_root != confirmed.state.pre_balance_root
+            || self.member_root != confirmed.state.member_root
+            || self.member_count != confirmed.state.member_count
+        {
+            return Err(LockValidationError::InvalidOnchainLock);
+        }
+        Ok(digest)
+    }
+
     pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, LockValidationError> {
+        if self.submissions.len() > MAX_BATCH_MEMBERS || self.balances.len() > MAX_BATCH_MEMBERS {
+            return Err(LockValidationError::MemberLimitExceeded);
+        }
+        let public_keys = self
+            .epoch_public_keys
+            .encode_wire()
+            .map_err(|_| LockValidationError::InvalidConfiguration)?;
+        if public_keys.len() > MAX_EPOCH_PUBLIC_KEYS_LEN {
+            return Err(LockValidationError::InvalidConfiguration);
+        }
+        let public_keys_len = u32::try_from(public_keys.len())
+            .map_err(|_| LockValidationError::InvalidConfiguration)?;
         let submission_count = u32::try_from(self.submissions.len())
             .map_err(|_| LockValidationError::MemberCountMismatch)?;
         let balance_count =
@@ -398,6 +490,8 @@ impl LockPackageV1 {
         bytes.push(1);
         bytes.extend_from_slice(self.epoch_account.as_ref());
         bytes.extend_from_slice(&self.configuration.encode());
+        bytes.extend_from_slice(&public_keys_len.to_le_bytes());
+        bytes.extend_from_slice(&public_keys);
         bytes.extend_from_slice(&submission_count.to_le_bytes());
         for submission in &self.submissions {
             bytes.extend_from_slice(&submission.encode_wire());
@@ -417,7 +511,7 @@ impl LockPackageV1 {
     pub(crate) fn decode_wire(bytes: &[u8]) -> Result<Self, LockValidationError> {
         use crate::crypto::ENCRYPTED_SUBMISSION_V1_LEN;
 
-        const FIXED_PREFIX: usize = 1 + 32 + EpochConfigurationV1::ENCODED_LEN + 4;
+        const FIXED_PREFIX: usize = 1 + 32 + EpochConfigurationV1::ENCODED_LEN + 4 + 4;
         const FIXED_SUFFIX: usize = 4 + 164 + 32 + 32 + 4 + 32;
         if bytes.len() < FIXED_PREFIX + FIXED_SUFFIX || bytes[0] != 1 {
             return Err(LockValidationError::InvalidSubmission);
@@ -430,15 +524,41 @@ impl LockPackageV1 {
         let configuration_end = 33 + EpochConfigurationV1::ENCODED_LEN;
         let configuration = EpochConfigurationV1::decode(&bytes[33..configuration_end])
             .ok_or(LockValidationError::InvalidConfiguration)?;
-        let submission_count = u32::from_le_bytes(
+        let public_keys_len = u32::from_le_bytes(
             bytes[configuration_end..configuration_end + 4]
+                .try_into()
+                .map_err(|_| LockValidationError::InvalidConfiguration)?,
+        ) as usize;
+        if public_keys_len > MAX_EPOCH_PUBLIC_KEYS_LEN {
+            return Err(LockValidationError::InvalidConfiguration);
+        }
+        let public_keys_start = configuration_end + 4;
+        let public_keys_end = public_keys_start
+            .checked_add(public_keys_len)
+            .ok_or(LockValidationError::InvalidConfiguration)?;
+        let epoch_public_keys = EpochPublicKeys::decode_wire(
+            bytes
+                .get(public_keys_start..public_keys_end)
+                .ok_or(LockValidationError::InvalidConfiguration)?,
+        )
+        .map_err(|_| LockValidationError::InvalidConfiguration)?;
+        let count_end = public_keys_end
+            .checked_add(4)
+            .ok_or(LockValidationError::InvalidSubmission)?;
+        let submission_count = u32::from_le_bytes(
+            bytes
+                .get(public_keys_end..count_end)
+                .ok_or(LockValidationError::InvalidSubmission)?
                 .try_into()
                 .map_err(|_| LockValidationError::InvalidSubmission)?,
         ) as usize;
+        if submission_count > MAX_BATCH_MEMBERS {
+            return Err(LockValidationError::MemberLimitExceeded);
+        }
         let submissions_len = submission_count
             .checked_mul(ENCRYPTED_SUBMISSION_V1_LEN)
             .ok_or(LockValidationError::InvalidSubmission)?;
-        let submissions_start = configuration_end + 4;
+        let submissions_start = count_end;
         let submissions_end = submissions_start
             .checked_add(submissions_len)
             .ok_or(LockValidationError::InvalidSubmission)?;
@@ -459,6 +579,9 @@ impl LockPackageV1 {
                 .try_into()
                 .map_err(|_| LockValidationError::InvalidBalance)?,
         ) as usize;
+        if balance_count > MAX_BATCH_MEMBERS {
+            return Err(LockValidationError::MemberLimitExceeded);
+        }
         let balances_start = submissions_end + 4;
         let balances_end = balances_start
             .checked_add(
@@ -496,6 +619,7 @@ impl LockPackageV1 {
         Ok(Self {
             epoch_account,
             configuration,
+            epoch_public_keys,
             submissions,
             balances,
             balance_snapshot,
@@ -557,9 +681,9 @@ impl LockApprovalV1 {
 }
 
 pub struct ReferenceKeyper {
-    index: usize,
-    signing_key: SigningKey,
-    journal: LockJournal,
+    pub(crate) index: usize,
+    pub(crate) signing_key: SigningKey,
+    pub(crate) journal: LockJournal,
 }
 
 impl ReferenceKeyper {
@@ -576,6 +700,7 @@ impl ReferenceKeyper {
         &mut self,
         package: &LockPackageV1,
         confirmed: &ConfirmedOpenEpoch,
+        secret: &KeyperSecretShare,
     ) -> Result<LockApprovalV1, LockValidationError> {
         let configured = confirmed
             .configuration
@@ -583,7 +708,11 @@ impl ReferenceKeyper {
             .get(self.index)
             .ok_or(LockValidationError::WrongKeyper)?;
         let keyper_key = self.signing_key.verifying_key().to_bytes();
-        if configured.to_bytes() != keyper_key {
+        if configured.to_bytes() != keyper_key
+            || secret.index() != self.index
+            || secret.epoch_account() != package.epoch_account
+            || !package.epoch_public_keys.matches_share(secret)
+        {
             return Err(LockValidationError::WrongKeyper);
         }
         let digest = package.validate(confirmed)?;
@@ -593,6 +722,48 @@ impl ReferenceKeyper {
             digest,
             signature: self.signing_key.sign(&digest).to_bytes(),
         })
+    }
+
+    pub fn release_share(
+        &self,
+        package: &LockPackageV1,
+        confirmed: &ConfirmedLock,
+        secret: &KeyperSecretShare,
+        member_index: usize,
+    ) -> Result<ReleasedShareV1, LockValidationError> {
+        let digest = package.validate_locked(confirmed)?;
+        let configured = confirmed
+            .pool
+            .as_ref()
+            .and_then(|pool| pool.keypers.get(self.index))
+            .ok_or(LockValidationError::WrongKeyper)?;
+        if configured.to_bytes() != self.signing_key.verifying_key().to_bytes()
+            || self.journal.digest(package.epoch_account) != Some(digest)
+            || self.index != secret.index()
+            || secret.epoch_account() != package.epoch_account
+            || !package.epoch_public_keys.matches_share(secret)
+        {
+            return Err(LockValidationError::WrongKeyper);
+        }
+        let submission = package
+            .submissions
+            .get(member_index)
+            .ok_or(LockValidationError::InvalidSubmission)?;
+        let mut ciphertexts = BTreeSet::new();
+        if package
+            .submissions
+            .iter()
+            .any(|member| !ciphertexts.insert(Sha256::digest(&member.ciphertext)))
+        {
+            return Err(LockValidationError::InvalidSubmission);
+        }
+        secret
+            .release(
+                package.epoch_account,
+                confirmed.lock_digest(),
+                &submission.ciphertext,
+            )
+            .map_err(|_| LockValidationError::InvalidSubmission)
     }
 }
 
@@ -676,9 +847,10 @@ impl LockJournal {
 
 /// A lock capability that can only be produced by fetching a confirmed program account.
 pub struct ConfirmedLock {
-    epoch_account: Pubkey,
-    state: EpochStateV1,
-    confirmation_slot: u64,
+    pub(crate) epoch_account: Pubkey,
+    pub(crate) state: EpochStateV1,
+    pub(crate) pool: Option<PoolStateV1>,
+    pub(crate) confirmation_slot: u64,
 }
 
 impl ConfirmedLock {
@@ -724,10 +896,35 @@ impl ProgramClient {
             .get_account_with_commitment(&epoch_account, CommitmentConfig::confirmed())
             .map_err(|_| LockValidationError::Rpc)?;
         let account = response.value.ok_or(LockValidationError::MissingAccount)?;
-        confirmed_lock_from_account(
+        let initial_lock = confirmed_lock_from_account(
             epoch_account,
             account.owner,
             &account.data,
+            response.context.slot,
+        )?;
+        let response = self
+            .rpc
+            .get_multiple_accounts_with_commitment(
+                &[epoch_account, initial_lock.state.pool],
+                CommitmentConfig::confirmed(),
+            )
+            .map_err(|_| LockValidationError::Rpc)?;
+        if response.context.slot < initial_lock.confirmation_slot || response.value.len() != 2 {
+            return Err(LockValidationError::Rpc);
+        }
+        let mut accounts = response.value.into_iter();
+        let epoch = accounts
+            .next()
+            .flatten()
+            .ok_or(LockValidationError::MissingAccount)?;
+        let pool = accounts
+            .next()
+            .flatten()
+            .ok_or(LockValidationError::MissingAccount)?;
+        confirmed_lock_from_accounts(
+            epoch_account,
+            RpcAccountData::new(epoch.owner, &epoch.data),
+            RpcAccountData::new(pool.owner, &pool.data),
             response.context.slot,
         )
     }
@@ -936,15 +1133,75 @@ fn confirmed_lock_from_account(
     Ok(ConfirmedLock {
         epoch_account,
         state,
+        pool: None,
         confirmation_slot,
     })
 }
 
-fn member_root(submissions: &[EncryptedSubmissionV1]) -> Result<[u8; 32], LockValidationError> {
-    let leaves: Vec<_> = submissions
-        .iter()
-        .map(EncryptedSubmissionV1::commitment_bytes)
-        .collect();
+fn confirmed_lock_from_accounts(
+    epoch_account: Pubkey,
+    epoch_account_data: RpcAccountData<'_>,
+    pool_account_data: RpcAccountData<'_>,
+    confirmation_slot: u64,
+) -> Result<ConfirmedLock, LockValidationError> {
+    let mut confirmed = confirmed_lock_from_account(
+        epoch_account,
+        epoch_account_data.owner,
+        epoch_account_data.data,
+        confirmation_slot,
+    )?;
+    if pool_account_data.owner != ID {
+        return Err(LockValidationError::InvalidOnchainLock);
+    }
+    let pool = PoolStateV1::decode(pool_account_data.data)
+        .map_err(|_| LockValidationError::InvalidOnchainLock)?;
+    let (expected_pool, pool_bump) =
+        pool_address(&pool.operator, &pool.base_mint, &pool.quote_mint);
+    let (_, vault_bump) = vault_authority_address(&confirmed.state.pool);
+    let configuration = EpochConfigurationV1 {
+        pool: confirmed.state.pool,
+        epoch_id: confirmed.state.epoch_id,
+        base_mint: pool.base_mint,
+        quote_mint: pool.quote_mint,
+        base_lot_atoms: pool.base_lot_atoms,
+        quote_atoms_per_lot: confirmed.state.quote_atoms_per_lot,
+        minimum_count: confirmed.state.minimum_count,
+        lock_threshold: pool.lock_threshold,
+        settlement_threshold: pool.settlement_threshold,
+        keypers: pool.keypers,
+        lock_deadline: confirmed.state.lock_deadline,
+        abort_deadline: confirmed.state.abort_deadline,
+    };
+    if expected_pool != confirmed.state.pool
+        || pool.pool_bump != pool_bump
+        || pool.vault_bump != vault_bump
+        || pool.lock_threshold != 2
+        || pool.settlement_threshold != 2
+        || pool.base_lot_atoms == 0
+        || pool.base_mint == pool.quote_mint
+        || configuration.digest() != confirmed.state.configuration_hash
+    {
+        return Err(LockValidationError::InvalidOnchainLock);
+    }
+    confirmed.pool = Some(pool);
+    Ok(confirmed)
+}
+
+fn member_root(
+    public_keys: &EpochPublicKeys,
+    submissions: &[EncryptedSubmissionV1],
+) -> Result<[u8; 32], LockValidationError> {
+    let mut leaves = Vec::with_capacity(submissions.len() + 1);
+    leaves.push(
+        public_keys
+            .commitment_leaf()
+            .map_err(|_| LockValidationError::InvalidConfiguration)?,
+    );
+    leaves.extend(
+        submissions
+            .iter()
+            .map(EncryptedSubmissionV1::commitment_bytes),
+    );
     let refs: Vec<_> = leaves.iter().map(Vec::as_slice).collect();
     content_root(CommitmentDomain::MemberSet, &refs)
         .map_err(|_| LockValidationError::InvalidSubmission)
@@ -1184,5 +1441,41 @@ mod tests {
         assert!(confirmed_lock_from_account(epoch, ID, &invalid.encode(), 42).is_err());
 
         assert!(confirmed_lock_from_account(epoch, ID, &state.encode()[..383], 42).is_err());
+    }
+
+    #[test]
+    fn lock_wire_rejects_coordinator_counts_before_allocating() {
+        let configuration = EpochConfigurationV1 {
+            pool: Pubkey::new_unique(),
+            epoch_id: [1; 32],
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            base_lot_atoms: 1,
+            quote_atoms_per_lot: 100,
+            minimum_count: 4,
+            lock_threshold: 2,
+            settlement_threshold: 2,
+            keypers: [
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+            ],
+            lock_deadline: 900,
+            abort_deadline: 1_000,
+        };
+        let dealer = crate::EpochDealer::random().unwrap();
+        let encoded_keys = dealer.public_keys().encode_wire().unwrap();
+        let mut bytes = Vec::new();
+        bytes.push(1);
+        bytes.extend_from_slice(Pubkey::new_unique().as_ref());
+        bytes.extend_from_slice(&configuration.encode());
+        bytes.extend_from_slice(&(encoded_keys.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&encoded_keys);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.resize(bytes.len() + 264, 0);
+        assert_eq!(
+            LockPackageV1::decode_wire(&bytes),
+            Err(LockValidationError::MemberLimitExceeded)
+        );
     }
 }

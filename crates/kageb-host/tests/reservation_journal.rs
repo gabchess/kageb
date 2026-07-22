@@ -1,8 +1,9 @@
 use std::{fs, sync::Arc, thread};
 
+use ed25519_dalek::SigningKey;
 use kageb::{
     JournalError, PoolBalance, ReservationJournal, ReservationRecord, ReservationState,
-    SubmissionV1,
+    SubmissionV1, SuspensionError, SuspensionRegistry,
 };
 use tempfile::tempdir;
 
@@ -49,6 +50,20 @@ fn reservation_is_durable_before_success_and_cannot_replay() {
             .state([1; 32]),
         Some(ReservationState::Used)
     );
+}
+
+#[test]
+fn stale_reservation_lock_inode_does_not_block_restart() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("reservations.bin");
+    let mut journal = ReservationJournal::open(&path).expect("create journal");
+    journal
+        .reserve(record(1), PoolBalance::new(10, 1_000))
+        .expect("reserve");
+    fs::write(path.with_extension("lock"), b"stale process marker").expect("stale lock inode");
+
+    let restarted = ReservationJournal::open(&path).expect("restart after stale lock inode");
+    assert_eq!(restarted.state([1; 32]), Some(ReservationState::Reserved));
 }
 
 #[test]
@@ -191,5 +206,71 @@ fn truncated_or_tampered_journal_fails_closed() {
     assert!(matches!(
         ReservationJournal::open(&path),
         Err(JournalError::Corrupt)
+    ));
+}
+
+#[test]
+fn suspended_trading_key_survives_restart_and_blocks_later_authorization() {
+    let directory = tempdir().expect("tempdir");
+    let suspension_path = directory.path().join("suspensions.bin");
+    let reservation_path = directory.path().join("reservations.bin");
+    let trading = SigningKey::from_bytes(&[41; 32]);
+    let operator = SigningKey::from_bytes(&[90; 32]);
+    let trading_key = trading.verifying_key();
+
+    let mut reservations = ReservationJournal::open(&reservation_path).expect("reservations");
+    let first = reservations
+        .reserve(record(1), PoolBalance::new(10, 1_000))
+        .expect("first reservation");
+    let mut suspensions = SuspensionRegistry::open(&suspension_path).expect("registry");
+    assert!(suspensions
+        .issue_authorization(first, [42; 32], trading_key, &operator, 1_000)
+        .is_ok());
+
+    suspensions
+        .suspend(trading_key.to_bytes())
+        .expect("suspend");
+    let reopened = SuspensionRegistry::open(&suspension_path).expect("reopen registry");
+    assert!(reopened.is_suspended(trading_key.to_bytes()));
+
+    let later = reservations
+        .reserve(record(2), PoolBalance::new(10, 1_000))
+        .expect("later reservation");
+    assert_eq!(
+        reopened.issue_authorization(later, [43; 32], trading_key, &operator, 2_000),
+        Err(SuspensionError::Suspended)
+    );
+}
+
+#[test]
+fn stale_suspension_lock_inode_does_not_block_restart() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("suspensions.bin");
+    let mut registry = SuspensionRegistry::open(&path).expect("create registry");
+    registry.suspend([41; 32]).expect("suspend");
+    fs::write(
+        path.with_extension("suspension-lock"),
+        b"stale process marker",
+    )
+    .expect("stale lock inode");
+
+    let restarted = SuspensionRegistry::open(&path).expect("restart after stale lock inode");
+    assert!(restarted.is_suspended([41; 32]));
+}
+
+#[test]
+fn tampered_suspension_registry_fails_closed() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("suspensions.bin");
+    let mut registry = SuspensionRegistry::open(&path).expect("registry");
+    registry.suspend([41; 32]).expect("suspend");
+
+    let mut bytes = fs::read(&path).expect("read registry");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&path, bytes).expect("tamper registry");
+    assert!(matches!(
+        SuspensionRegistry::open(&path),
+        Err(SuspensionError::Corrupt)
     ));
 }

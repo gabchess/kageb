@@ -5,6 +5,7 @@ mod commitment;
 mod crypto;
 mod demo;
 mod domain;
+mod evidence;
 mod keyper;
 mod ledger;
 mod lock;
@@ -12,18 +13,24 @@ mod observer;
 
 pub use admission::{
     JournalError, ReservationJournal, ReservationRecord, ReservationState, SubmissionV1,
-    UnsignedFundedAuthorizationV1,
+    SuspensionError, SuspensionRegistry, UnsignedFundedAuthorizationV1,
 };
 pub use commitment::{content_root, CommitmentDomain, CommitmentError};
 pub use crypto::{
     admit_batch, AdmissionPolicyV1, AdmittedBatch, CryptoError, EncryptedIntentV1,
     EncryptedSubmissionV1, EpochDealer, EpochPublicKeys, FundedAuthorizationV1, KeyperSecretShare,
-    SignedIntentV1, ENCRYPTED_INTENT_V1_LEN, FUNDED_AUTHORIZATION_V1_LEN,
+    ReleasedShareV1, SignedIntentV1, ENCRYPTED_INTENT_V1_LEN, FUNDED_AUTHORIZATION_V1_LEN,
 };
-pub use demo::trace_fixture;
+pub use demo::{local_proof, trace_fixture};
 pub use domain::{IntentBodyV1, ProtocolError, Side};
+pub use evidence::{
+    DecryptionEvidenceV1, SettlementApprovalV1, SettlementBalanceV1, SettlementRequestV1,
+    SettlementValidationError,
+};
 pub use keyper::{
-    handle_keyper_self_test, run_keyper_self_test, KeyperProcessError, KeyperSelfTestResponse,
+    handle_keyper_release_share, handle_keyper_self_test, handle_keyper_sign_settlement,
+    run_keyper_release_share, run_keyper_self_test, run_keyper_sign_settlement, KeyperProcessError,
+    KeyperSelfTestResponse,
 };
 pub use keyper::{handle_keyper_sign_lock, run_keyper_sign_lock};
 pub use ledger::{
@@ -33,5 +40,8 @@ pub use ledger::{
 pub use lock::{
     BalanceRecordV1, ConfirmedLock, ConfirmedOpenEpoch, LockApprovalV1, LockJournal, LockPackageV1,
     LockValidationError, ProgramClient, ReferenceKeyper, SignedBalanceSnapshotV1,
+    MAX_BATCH_MEMBERS,
 };
-pub use observer::{DirectOrder, PublicTrace};
+pub use observer::{
+    DirectMarketAccounts, DirectOrder, KagebObserverAccounts, ObserverError, PublicTrace,
+};

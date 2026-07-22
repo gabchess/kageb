@@ -2920,6 +2920,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
+ "bs58",
  "ed25519-dalek 2.2.0",
  "getrandom 0.1.16",
  "kageb-program",
@@ -2929,9 +2930,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "solana-commitment-config",
+ "solana-ed25519-program",
+ "solana-keypair",
+ "solana-message 3.1.0",
  "solana-program",
  "solana-rpc-client",
  "solana-sdk",
+ "solana-signature",
+ "solana-signer",
+ "solana-system-interface 3.0.0",
+ "solana-transaction 3.1.0",
+ "solana-transaction-status-client-types",
+ "spl-token-interface",
  "tempfile",
  "threshold_crypto",
  "zeroize",
@@ -2954,7 +2964,19 @@ dependencies = [
  "solana-sysvar 4.0.0",
  "solana-transaction 3.1.0",
  "solana-transaction-error",
+ "spl-token-interface",
  "tokio",
+]
+
+[[package]]
+name = "kageb-token-fixture"
+version = "0.1.0"
+dependencies = [
+ "solana-account-info",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-pubkey 3.0.0",
+ "spl-token",
 ]
 
 [[package]]
@@ -7820,6 +7842,34 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "solana-zero-copy",
  "solana-zk-sdk 4.0.0",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "spl-token"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878b0183d51fcd8a53e1604f4c13321894cf53227e6773c529b0d03d499a8dfd"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "num_enum",
+ "solana-account-info",
+ "solana-cpi",
+ "solana-instruction",
+ "solana-msg",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-program-memory",
+ "solana-program-option",
+ "solana-program-pack",
+ "solana-pubkey 3.0.0",
+ "solana-rent 3.1.0",
+ "solana-sdk-ids",
+ "solana-sysvar 3.1.1",
+ "spl-token-interface",
  "thiserror 2.0.19",
 ]
 

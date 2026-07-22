@@ -1,0 +1,24 @@
+[package]
+name = "kageb-token-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+custom-heap = []
+custom-panic = []
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+solana-account-info = "=3.1.1"
+solana-program-entrypoint = "=3.1.1"
+solana-program-error = "=3.0.1"
+solana-pubkey = "=3.0.0"
+spl-token = { version = "=9.0.0", features = ["no-entrypoint"] }

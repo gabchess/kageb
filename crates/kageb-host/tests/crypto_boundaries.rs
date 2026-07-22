@@ -4,7 +4,7 @@ use ed25519_dalek::SigningKey;
 use kageb::{
     admit_batch, AdmissionPolicyV1, CryptoError, EncryptedSubmissionV1, EpochDealer,
     FundedAuthorizationV1, IntentBodyV1, PoolBalance, ReservationJournal, ReservationRecord, Side,
-    SignedIntentV1, ENCRYPTED_INTENT_V1_LEN, FUNDED_AUTHORIZATION_V1_LEN,
+    SignedIntentV1, SuspensionRegistry, ENCRYPTED_INTENT_V1_LEN, FUNDED_AUTHORIZATION_V1_LEN,
 };
 use tempfile::tempdir;
 
@@ -65,13 +65,16 @@ fn authorization_with(
             PoolBalance::new(member.base_atoms, member.quote_atoms),
         )
         .expect("reserve");
-    FundedAuthorizationV1::sign(
-        reserved,
-        epoch,
-        trading.verifying_key(),
-        operator,
-        member.expiry,
-    )
+    SuspensionRegistry::open(directory.path().join("suspensions.bin"))
+        .expect("suspensions")
+        .issue_authorization(
+            reserved,
+            epoch,
+            trading.verifying_key(),
+            operator,
+            member.expiry,
+        )
+        .expect("authorization")
 }
 
 fn policy(epoch: [u8; 32], operator: &SigningKey) -> AdmissionPolicyV1 {

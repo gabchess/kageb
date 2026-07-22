@@ -5,13 +5,13 @@ use kageb_program::{
     error::KagebError,
     instruction::{
         abort_instruction, create_epoch_instruction, expire_instruction,
-        initialize_pool_instruction, lock_instruction, CreateEpochArgs, InitializePoolAccounts,
-        InitializePoolArgs,
+        initialize_pool_instruction, lock_instruction, settle_instruction, CreateEpochArgs,
+        InitializePoolAccounts, InitializePoolArgs, SettleAccounts,
     },
     pool_address,
     state::{EpochStateV1, EpochTerminalState, PoolStateV1},
     vault_authority_address,
-    wire::{EpochConfigurationV1, LockPayloadV1},
+    wire::{EpochConfigurationV1, LockPayloadV1, SettlementPayloadV1},
     ID, TOKEN_PROGRAM_ID,
 };
 use solana_account::{Account, AccountSharedData};
@@ -102,7 +102,6 @@ impl Fixture {
         program_test.add_account(venue_authority.pubkey(), system_account());
         program_test.add_account(outsider.pubkey(), system_account());
         program_test.add_account(vault_authority, system_account());
-        program_test.add_account(TOKEN_PROGRAM_ID, token_program_account());
         let base_mint_account = match shape {
             InitAccountShape::BaseMintOwnedBy(owner) => mint_account_owned_by(owner),
             _ => mint_account(),
@@ -221,6 +220,440 @@ impl Fixture {
             abort_deadline: abort,
         }
     }
+
+    async fn lock_epoch(
+        &mut self,
+        epoch_id: [u8; 32],
+        lock_deadline: i64,
+        abort_deadline: i64,
+    ) -> (Pubkey, LockPayloadV1) {
+        let epoch = self
+            .create_epoch(epoch_id, lock_deadline, abort_deadline)
+            .await;
+        let payload = LockPayloadV1 {
+            epoch_account: epoch,
+            configuration_hash: self
+                .config(epoch_id, lock_deadline, abort_deadline)
+                .digest(),
+            pre_balance_root: [61; 32],
+            member_root: [62; 32],
+            member_count: 4,
+            lock_deadline,
+            lock_nonce: [63; 32],
+        };
+        let digest = payload.digest();
+        process(
+            &mut self.context,
+            &[
+                verifier(&self.keypers[0], &digest),
+                verifier(&self.keypers[1], &digest),
+                lock_instruction(self.outsider.pubkey(), self.pool, epoch, payload),
+            ],
+            &[&self.outsider],
+        )
+        .await
+        .unwrap();
+        (epoch, payload)
+    }
+
+    fn settlement_payload(
+        &self,
+        epoch: Pubkey,
+        lock: LockPayloadV1,
+        residual_side: u8,
+        residual_lots: u32,
+    ) -> SettlementPayloadV1 {
+        SettlementPayloadV1 {
+            epoch_account: epoch,
+            lock_digest: lock.digest(),
+            result_commitment: [64; 32],
+            residual_side,
+            residual_lots,
+            base_lot_atoms: 1,
+            quote_atoms_per_lot: 100,
+            base_mint: self.base_mint,
+            quote_mint: self.quote_mint,
+            pool_base_vault: self.pool_base_vault,
+            pool_quote_vault: self.pool_quote_vault,
+            venue_base_account: self.venue_base_account,
+            venue_quote_account: self.venue_quote_account,
+            venue_authority: self.venue_authority.pubkey(),
+            settlement_nonce: [65; 32],
+        }
+    }
+
+    fn settlement_instruction(&self, epoch: Pubkey, payload: SettlementPayloadV1) -> Instruction {
+        settle_instruction(
+            SettleAccounts {
+                payer: self.outsider.pubkey(),
+                pool: self.pool,
+                epoch,
+                vault_authority: self.vault_authority,
+                pool_base_vault: self.pool_base_vault,
+                pool_quote_vault: self.pool_quote_vault,
+                venue_authority: self.venue_authority.pubkey(),
+                venue_base_account: self.venue_base_account,
+                venue_quote_account: self.venue_quote_account,
+                base_mint: self.base_mint,
+                quote_mint: self.quote_mint,
+            },
+            payload,
+        )
+    }
+}
+
+#[tokio::test]
+async fn settle_net_buy_moves_exact_checked_token_legs_and_marks_the_epoch() {
+    let mut fixture = Fixture::start().await;
+    fixture.initialize().await;
+    set_token_amount(&mut fixture.context, fixture.pool_base_vault, 10).await;
+    set_token_amount(&mut fixture.context, fixture.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut fixture.context, fixture.venue_base_account, 10).await;
+    set_token_amount(&mut fixture.context, fixture.venue_quote_account, 0).await;
+    let now = fixture
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let (epoch, lock) = fixture.lock_epoch([60; 32], now + 100, now + 200).await;
+    let payload = fixture.settlement_payload(epoch, lock, 1, 2);
+    let digest = payload.digest();
+    let settlement = fixture.settlement_instruction(epoch, payload);
+
+    process(
+        &mut fixture.context,
+        &[
+            verifier(&fixture.keypers[0], &digest),
+            verifier(&fixture.keypers[1], &digest),
+            settlement,
+        ],
+        &[&fixture.outsider, &fixture.venue_authority],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        token_amount(&mut fixture.context, fixture.pool_base_vault).await,
+        12
+    );
+    assert_eq!(
+        token_amount(&mut fixture.context, fixture.pool_quote_vault).await,
+        800
+    );
+    assert_eq!(
+        token_amount(&mut fixture.context, fixture.venue_base_account).await,
+        8
+    );
+    assert_eq!(
+        token_amount(&mut fixture.context, fixture.venue_quote_account).await,
+        200
+    );
+    let state = read_epoch(&mut fixture.context, epoch).await;
+    assert_eq!(state.terminal_state, EpochTerminalState::Settled);
+    assert_eq!(state.residual_side, 1);
+    assert_eq!(state.residual_lots, 2);
+    assert_eq!(state.result_commitment, [64; 32]);
+    assert_eq!(state.settlement_digest, digest);
+    assert_eq!(state.settlement_nonce, [65; 32]);
+}
+
+#[tokio::test]
+async fn settle_net_sell_and_zero_residual_have_exact_token_effects() {
+    let mut sell = Fixture::start().await;
+    sell.initialize().await;
+    set_token_amount(&mut sell.context, sell.pool_base_vault, 10).await;
+    set_token_amount(&mut sell.context, sell.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut sell.context, sell.venue_base_account, 10).await;
+    set_token_amount(&mut sell.context, sell.venue_quote_account, 1_000).await;
+    let now = sell
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let (epoch, lock) = sell.lock_epoch([66; 32], now + 100, now + 200).await;
+    let payload = sell.settlement_payload(epoch, lock, 2, 2);
+    settle_with(&mut sell, epoch, payload, [0, 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        token_amount(&mut sell.context, sell.pool_base_vault).await,
+        8
+    );
+    assert_eq!(
+        token_amount(&mut sell.context, sell.pool_quote_vault).await,
+        1_200
+    );
+    assert_eq!(
+        token_amount(&mut sell.context, sell.venue_base_account).await,
+        12
+    );
+    assert_eq!(
+        token_amount(&mut sell.context, sell.venue_quote_account).await,
+        800
+    );
+    assert_eq!(
+        read_epoch(&mut sell.context, epoch).await.terminal_state,
+        EpochTerminalState::Settled
+    );
+
+    let mut zero = Fixture::start().await;
+    zero.initialize().await;
+    set_token_amount(&mut zero.context, zero.pool_base_vault, 10).await;
+    set_token_amount(&mut zero.context, zero.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut zero.context, zero.venue_base_account, 10).await;
+    set_token_amount(&mut zero.context, zero.venue_quote_account, 1_000).await;
+    let now = zero
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let (epoch, lock) = zero.lock_epoch([67; 32], now + 100, now + 200).await;
+    let payload = zero.settlement_payload(epoch, lock, 0, 0);
+    settle_with(&mut zero, epoch, payload, [0, 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        token_amount(&mut zero.context, zero.pool_base_vault).await,
+        10
+    );
+    assert_eq!(
+        token_amount(&mut zero.context, zero.pool_quote_vault).await,
+        1_000
+    );
+    assert_eq!(
+        token_amount(&mut zero.context, zero.venue_base_account).await,
+        10
+    );
+    assert_eq!(
+        token_amount(&mut zero.context, zero.venue_quote_account).await,
+        1_000
+    );
+    let state = read_epoch(&mut zero.context, epoch).await;
+    assert_eq!(state.terminal_state, EpochTerminalState::Settled);
+    assert_eq!(state.residual_side, 0);
+    assert_eq!(state.residual_lots, 0);
+}
+
+#[tokio::test]
+async fn settle_rejects_substitution_payload_drift_bad_quorum_and_duplicates_atomically() {
+    let mut fixture = Fixture::start().await;
+    fixture.initialize().await;
+    set_token_amount(&mut fixture.context, fixture.pool_base_vault, 10).await;
+    set_token_amount(&mut fixture.context, fixture.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut fixture.context, fixture.venue_base_account, 10).await;
+    set_token_amount(&mut fixture.context, fixture.venue_quote_account, 1_000).await;
+    let now = fixture
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let (epoch, lock) = fixture.lock_epoch([68; 32], now + 100, now + 200).await;
+    let payload = fixture.settlement_payload(epoch, lock, 1, 2);
+
+    let mut substitutions = Vec::new();
+    let mut wrong_venue_signer = fixture.settlement_instruction(epoch, payload);
+    wrong_venue_signer.accounts[6].pubkey = fixture.operator.pubkey();
+    substitutions.push((wrong_venue_signer, true));
+    let mut wrong_pool = fixture.settlement_instruction(epoch, payload);
+    wrong_pool.accounts[1].pubkey = fixture.operator.pubkey();
+    substitutions.push((wrong_pool, false));
+    let mut wrong_vault_authority = fixture.settlement_instruction(epoch, payload);
+    wrong_vault_authority.accounts[3].pubkey = fixture.operator.pubkey();
+    substitutions.push((wrong_vault_authority, false));
+    let mut swapped_vaults = fixture.settlement_instruction(epoch, payload);
+    swapped_vaults.accounts.swap(4, 5);
+    substitutions.push((swapped_vaults, false));
+    let mut swapped_mints = fixture.settlement_instruction(epoch, payload);
+    swapped_mints.accounts.swap(9, 10);
+    substitutions.push((swapped_mints, false));
+    let mut wrong_token_program = fixture.settlement_instruction(epoch, payload);
+    wrong_token_program.accounts[11].pubkey = solana_system_interface::program::ID;
+    substitutions.push((wrong_token_program, false));
+    let mut duplicate_mutable = fixture.settlement_instruction(epoch, payload);
+    duplicate_mutable.accounts[5].pubkey = duplicate_mutable.accounts[4].pubkey;
+    substitutions.push((duplicate_mutable, false));
+
+    for (instruction, needs_operator) in substitutions {
+        let digest = payload.digest();
+        let signers = if needs_operator {
+            vec![&fixture.outsider, &fixture.operator]
+        } else {
+            vec![&fixture.outsider, &fixture.venue_authority]
+        };
+        assert!(process(
+            &mut fixture.context,
+            &[
+                verifier(&fixture.keypers[0], &digest),
+                verifier(&fixture.keypers[1], &digest),
+                instruction,
+            ],
+            &signers,
+        )
+        .await
+        .is_err());
+        assert_locked_unchanged(&mut fixture, epoch, [10, 1_000, 10, 1_000]).await;
+    }
+
+    for changed in [
+        SettlementPayloadV1 {
+            base_lot_atoms: 2,
+            ..payload
+        },
+        SettlementPayloadV1 {
+            quote_atoms_per_lot: 101,
+            ..payload
+        },
+        SettlementPayloadV1 {
+            lock_digest: [69; 32],
+            ..payload
+        },
+        SettlementPayloadV1 {
+            settlement_nonce: lock.lock_nonce,
+            ..payload
+        },
+        SettlementPayloadV1 {
+            residual_side: 0,
+            ..payload
+        },
+    ] {
+        assert!(settle_with(&mut fixture, epoch, changed, [0, 1])
+            .await
+            .is_err());
+        assert_locked_unchanged(&mut fixture, epoch, [10, 1_000, 10, 1_000]).await;
+    }
+
+    assert!(settle_with(&mut fixture, epoch, payload, [0, 0])
+        .await
+        .is_err());
+    assert!(settle_with(&mut fixture, epoch, payload, [0, 2])
+        .await
+        .is_ok());
+    assert!(settle_with(&mut fixture, epoch, payload, [0, 1])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn settlement_overflow_cpi_failure_and_post_abort_leave_tokens_and_state_unchanged() {
+    let mut overflow = Fixture::start().await;
+    let mut initialize = overflow.valid_initialize_args();
+    initialize.base_lot_atoms = u64::MAX;
+    let instruction = overflow.initialize_instruction(initialize);
+    process(&mut overflow.context, &[instruction], &[&overflow.operator])
+        .await
+        .unwrap();
+    let now = overflow
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let epoch_id = [70; 32];
+    let epoch = overflow.create_epoch(epoch_id, now + 100, now + 200).await;
+    let lock = LockPayloadV1 {
+        epoch_account: epoch,
+        configuration_hash: EpochConfigurationV1 {
+            base_lot_atoms: u64::MAX,
+            ..overflow.config(epoch_id, now + 100, now + 200)
+        }
+        .digest(),
+        pre_balance_root: [71; 32],
+        member_root: [72; 32],
+        member_count: 4,
+        lock_deadline: now + 100,
+        lock_nonce: [73; 32],
+    };
+    let digest = lock.digest();
+    process(
+        &mut overflow.context,
+        &[
+            verifier(&overflow.keypers[0], &digest),
+            verifier(&overflow.keypers[1], &digest),
+            lock_instruction(overflow.outsider.pubkey(), overflow.pool, epoch, lock),
+        ],
+        &[&overflow.outsider],
+    )
+    .await
+    .unwrap();
+    let payload = SettlementPayloadV1 {
+        base_lot_atoms: u64::MAX,
+        ..overflow.settlement_payload(epoch, lock, 1, 2)
+    };
+    assert!(settle_with(&mut overflow, epoch, payload, [0, 1])
+        .await
+        .is_err());
+    assert_eq!(
+        read_epoch(&mut overflow.context, epoch)
+            .await
+            .terminal_state,
+        EpochTerminalState::Locked
+    );
+
+    let mut rollback = Fixture::start().await;
+    rollback.initialize().await;
+    set_token_amount(&mut rollback.context, rollback.pool_base_vault, 10).await;
+    set_token_amount(&mut rollback.context, rollback.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut rollback.context, rollback.venue_base_account, 1).await;
+    set_token_amount(&mut rollback.context, rollback.venue_quote_account, 1_000).await;
+    let now = rollback
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap()
+        .unix_timestamp;
+    let (epoch, lock) = rollback.lock_epoch([74; 32], now + 100, now + 200).await;
+    let payload = rollback.settlement_payload(epoch, lock, 1, 2);
+    assert!(settle_with(&mut rollback, epoch, payload, [0, 1])
+        .await
+        .is_err());
+    assert_locked_unchanged(&mut rollback, epoch, [10, 1_000, 1, 1_000]).await;
+
+    let mut aborted = Fixture::start().await;
+    aborted.initialize().await;
+    let mut clock = aborted
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap();
+    let (epoch, lock) = aborted
+        .lock_epoch(
+            [75; 32],
+            clock.unix_timestamp + 10,
+            clock.unix_timestamp + 20,
+        )
+        .await;
+    clock.unix_timestamp += 21;
+    aborted.context.set_sysvar(&clock);
+    process(
+        &mut aborted.context,
+        &[abort_instruction(
+            aborted.outsider.pubkey(),
+            aborted.pool,
+            epoch,
+        )],
+        &[&aborted.outsider],
+    )
+    .await
+    .unwrap();
+    let payload = aborted.settlement_payload(epoch, lock, 0, 0);
+    assert!(settle_with(&mut aborted, epoch, payload, [0, 1])
+        .await
+        .is_err());
+    assert_eq!(
+        read_epoch(&mut aborted.context, epoch).await.terminal_state,
+        EpochTerminalState::Aborted
+    );
 }
 
 #[tokio::test]
@@ -1076,6 +1509,45 @@ async fn prefund(context: &mut ProgramTestContext, address: Pubkey, lamports: u6
     process(context, &[instruction], &[]).await.unwrap();
 }
 
+async fn settle_with(
+    fixture: &mut Fixture,
+    epoch: Pubkey,
+    payload: SettlementPayloadV1,
+    keyper_indices: [usize; 2],
+) -> Result<(), BanksClientError> {
+    let digest = payload.digest();
+    let instruction = fixture.settlement_instruction(epoch, payload);
+    let instructions = [
+        verifier(&fixture.keypers[keyper_indices[0]], &digest),
+        verifier(&fixture.keypers[keyper_indices[1]], &digest),
+        instruction,
+    ];
+    process(
+        &mut fixture.context,
+        &instructions,
+        &[&fixture.outsider, &fixture.venue_authority],
+    )
+    .await
+}
+
+async fn assert_locked_unchanged(fixture: &mut Fixture, epoch: Pubkey, expected: [u64; 4]) {
+    assert_eq!(
+        read_epoch(&mut fixture.context, epoch).await.terminal_state,
+        EpochTerminalState::Locked
+    );
+    for (address, amount) in [
+        fixture.pool_base_vault,
+        fixture.pool_quote_vault,
+        fixture.venue_base_account,
+        fixture.venue_quote_account,
+    ]
+    .into_iter()
+    .zip(expected)
+    {
+        assert_eq!(token_amount(&mut fixture.context, address).await, amount);
+    }
+}
+
 async fn process(
     context: &mut ProgramTestContext,
     instructions: &[Instruction],
@@ -1101,6 +1573,27 @@ async fn read_epoch(context: &mut ProgramTestContext, epoch: Pubkey) -> EpochSta
         .unwrap()
         .unwrap();
     EpochStateV1::decode(&account.data).unwrap()
+}
+
+async fn set_token_amount(context: &mut ProgramTestContext, address: Pubkey, amount: u64) {
+    let mut account = context
+        .banks_client
+        .get_account(address)
+        .await
+        .unwrap()
+        .unwrap();
+    account.data[64..72].copy_from_slice(&amount.to_le_bytes());
+    context.set_account(&address, &AccountSharedData::from(account));
+}
+
+async fn token_amount(context: &mut ProgramTestContext, address: Pubkey) -> u64 {
+    let account = context
+        .banks_client
+        .get_account(address)
+        .await
+        .unwrap()
+        .unwrap();
+    u64::from_le_bytes(account.data[64..72].try_into().unwrap())
 }
 
 fn verifier(keyper: &Keypair, digest: &[u8; 32]) -> Instruction {
@@ -1196,15 +1689,6 @@ fn collect_files(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf
         } else if kind.is_file() {
             files.push(entry.path());
         }
-    }
-}
-
-fn token_program_account() -> Account {
-    Account {
-        lamports: 1_000_000,
-        owner: solana_program::bpf_loader::ID,
-        executable: true,
-        ..Account::default()
     }
 }
 

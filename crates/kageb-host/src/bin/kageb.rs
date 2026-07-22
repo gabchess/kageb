@@ -18,12 +18,23 @@ fn main() -> ExitCode {
                 }
             }
         }
-        [group, command]
-            if group == "keyper"
-                && matches!(command.as_str(), "release-share" | "sign-settlement") =>
-        {
-            eprintln!("unsupported until a confirmed onchain lock exists");
-            ExitCode::from(3)
+        [group, command] if group == "keyper" && command == "release-share" => {
+            match kageb::handle_keyper_release_share() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("release-share request rejected: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        [group, command] if group == "keyper" && command == "sign-settlement" => {
+            match kageb::handle_keyper_sign_settlement() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("sign-settlement request rejected: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         [command] if command == "trace" => match kageb::trace_fixture() {
             Ok(output) => {
@@ -35,8 +46,18 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        [group, command] if group == "demo" && command == "local" => match kageb::local_proof() {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("local demo failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
-            eprintln!("usage: kageb trace");
+            eprintln!("usage: kageb trace | kageb demo local");
             ExitCode::from(2)
         }
     }

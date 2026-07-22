@@ -25,6 +25,7 @@ solana-instructions-sysvar = "=3.0.0"
 solana-sdk-ids = "=3.1.0"
 solana-system-interface = { version = "=3.0.0", features = ["bincode"] }
 solana-sysvar = "=4.0.0"
+spl-token-interface = "=2.0.0"
 
 [dev-dependencies]
 solana-account = "=3.4.0"
