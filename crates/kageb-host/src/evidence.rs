@@ -1193,7 +1193,7 @@ fn build_toolchain_mismatch(
     expected: &EvidenceBuildToolchainV1,
     observed: &EvidenceBuildToolchainV1,
 ) -> Option<String> {
-    [
+    let exact_mismatch = [
         ("host_rustc", &expected.host_rustc, &observed.host_rustc),
         (
             "cargo_build_sbf",
@@ -1206,7 +1206,6 @@ fn build_toolchain_mismatch(
             &observed.platform_tools,
         ),
         ("sbf_rustc", &expected.sbf_rustc, &observed.sbf_rustc),
-        ("solana_cli", &expected.solana_cli, &observed.solana_cli),
     ]
     .into_iter()
     .find(|(_, expected, observed)| expected != observed)
@@ -1214,7 +1213,35 @@ fn build_toolchain_mismatch(
         format!(
             "canonical checkpoint {field} differs from evidence: expected {expected:?}, observed {observed:?}"
         )
-    })
+    });
+    if exact_mismatch.is_some() {
+        return exact_mismatch;
+    }
+
+    if solana_cli_release_identity(&expected.solana_cli)
+        != solana_cli_release_identity(&observed.solana_cli)
+    {
+        return Some(format!(
+            "canonical checkpoint solana_cli release differs from evidence: expected {:?}, observed {:?}",
+            expected.solana_cli, observed.solana_cli
+        ));
+    }
+    None
+}
+
+fn solana_cli_release_identity(identity: &str) -> Option<(&str, &str)> {
+    let mut fields = identity.split_ascii_whitespace();
+    let name = fields.next()?;
+    let version = fields.next()?;
+    if name != "solana-cli"
+        || version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    Some((name, version))
 }
 
 fn read_evidence_input(path: &Path) -> Result<String, String> {
@@ -2494,5 +2521,19 @@ mod tests {
             )
         );
         assert_eq!(build_toolchain_mismatch(&expected, &expected), None);
+
+        let mut linux_release = expected.clone();
+        linux_release.solana_cli =
+            "solana-cli 4.0.1 (src:252cbf3e; feat:dda54cf7, client:Agave)".to_owned();
+        assert_eq!(build_toolchain_mismatch(&expected, &linux_release), None);
+
+        linux_release.solana_cli = "solana-cli 4.0.2 (src:252cbf3e)".to_owned();
+        assert_eq!(
+            build_toolchain_mismatch(&expected, &linux_release),
+            Some(
+                "canonical checkpoint solana_cli release differs from evidence: expected \"solana-cli 4.0.1\", observed \"solana-cli 4.0.2 (src:252cbf3e)\""
+                    .to_owned()
+            )
+        );
     }
 }
