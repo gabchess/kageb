@@ -1084,6 +1084,14 @@ pub(crate) fn build_canonical_checkpoint(commit: &str) -> Result<CanonicalCheckp
     }
 
     let cargo = crate::demo::resolve_cargo().map_err(|_| "resolve cargo failed".to_owned())?;
+    command_output(
+        std::process::Command::new(&cargo)
+            .args(["build-sbf", "--manifest-path"])
+            .arg(checkout.join("crates/kageb-program/Cargo.toml"))
+            .args(["--", "--locked"])
+            .current_dir(&checkout),
+        "build canonical checkpoint",
+    )?;
     let build_versions = command_output(
         std::process::Command::new(&cargo)
             .args(["build-sbf", "--version"])
@@ -1133,14 +1141,6 @@ pub(crate) fn build_canonical_checkpoint(commit: &str) -> Result<CanonicalCheckp
     )?
     .trim()
     .to_owned();
-    command_output(
-        std::process::Command::new(&cargo)
-            .args(["build-sbf", "--manifest-path"])
-            .arg(checkout.join("crates/kageb-program/Cargo.toml"))
-            .args(["--", "--locked"])
-            .current_dir(&checkout),
-        "build canonical checkpoint",
-    )?;
     let artifact = std::fs::read(checkout.join("target/deploy/kageb_program.so"))
         .map_err(|_| "read canonical checkpoint artifact failed".to_owned())?;
     if !artifact.starts_with(b"\x7fELF") {
