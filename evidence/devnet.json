@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "content": {
+    "cluster": "devnet",
+    "public_commit": "5baf9651925ac2fd546b28604ecc0fe2f49d45ae",
+    "build_toolchain": {
+      "host_rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "cargo_build_sbf": "cargo-build-sbf 4.0.0",
+      "platform_tools": "platform-tools v1.53",
+      "sbf_rustc": "rustc 1.89.0",
+      "solana_cli": "solana-cli 4.0.1 (src:e4e3aa49; feat:6ff76655, client:Agave)"
+    },
+    "checkpoint_artifact_len": 187872,
+    "checkpoint_artifact_sha256": "da0d4f946bd392089e7d56d963bffbf362741a0fb970d4243c956525c2c0eef2",
+    "deployment": {
+      "program": "HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77",
+      "loader": "BPFLoaderUpgradeab1e11111111111111111111111",
+      "programdata": "68EgQjUP8G7wMWXVfXvAhuK4WaueP432QFYJbPk5wubq",
+      "deployment_slot": 478175982,
+      "upgrade_authority": "8gbaJEfM5VDs9BpFLgwMTq7s2FkVpEri8ZnPbxn4HPqY",
+      "deployed_executable_sha256": "da0d4f946bd392089e7d56d963bffbf362741a0fb970d4243c956525c2c0eef2"
+    },
+    "transactions": {
+      "funding": [
+        {
+          "authority": "9bYg1b8iDtCE9iX5vgqkrRhfGh2M52uRC5X7SspDCqjy",
+          "base_source": "AKzJBqeVnGBWVGr6cY1QUrLDcKmESDyxWnh3nVYuzSd1",
+          "quote_source": "9WAFV8zXw9jCMeYRAPsnJ6oWeHNuTxvevsBACHscHuch",
+          "transaction": {
+            "signature": "7K4q5T4H27t2fb25jw4k5Y2sxb2f4diPYKkTKL4UcXVPa7Lr9xX6cDhgYmaaBLQByvj2RMsiAtUb8jRv4bFS1y9",
+            "slot": 478176097
+          }
+        },
+        {
+          "authority": "B1ESNmYp9381zeupxt7X7UMv8YbL13PV1Yev5fgvzFJy",
+          "base_source": "CEZCv8EBV4AiKog3YNENtaEdu5pzeGXqeiuHToDEv62A",
+          "quote_source": "2ggBcYHEGgj1jRxoH6ptQHNYNFqtkXdFHuuMhYT1m8US",
+          "transaction": {
+            "signature": "2E2VaURsbkScwn2h9nCobZAzUgDMXmxEP9Y5Gm8EhTDpBjnhJn4T6FmroNhw1wY2ZMjRmGgNSZ3sxvDFDQ2QRwNc",
+            "slot": 478176145
+          }
+        },
+        {
+          "authority": "7hSUHv9E6eW2EKEWWr9WGnyqMAdV9NaGZGkwR8dYnj8J",
+          "base_source": "52QwEZtrjy6kB9ewww7trk9mFfwAt86eL6LgV6xgmrTu",
+          "quote_source": "AP75Yqi2kUZtPkoJ4kQ9tW1kcBcmPtcuW3BK4Ti2heF8",
+          "transaction": {
+            "signature": "YsnmSXS4c9kEJrZmJnXd7Vxo7LVqnGMDaZieRz2o1vV9mYM2TJPFyHZBkw1cjsUfwArhCXvtV2QHc5wmbniGQ6X",
+            "slot": 478176195
+          }
+        },
+        {
+          "authority": "Fg4FsVR1dgL54fwwc9zrvHuey7Mo3mPq2fmuqhrYs6SV",
+          "base_source": "FSmFSCGKhNwp6LGwYKnchgZsDNpmJseJjwymCfgAy1u5",
+          "quote_source": "5sQa1RnMR5pMYgD8rG98qAS4pXgdf93L21GhVnQyzzzz",
+          "transaction": {
+            "signature": "bESf5r588twaeeGG6XMmXFLGhrwJe4aThmzyRKZFVvBdwYukphxcmZfFrvWwXX4vukjrDb1mNeGfbRBwUVzLtmY",
+            "slot": 478176244
+          }
+        }
+      ],
+      "lock": {
+        "signature": "4N1kxRiW7KZ4G8WN5WqPkSG6aX1y8xHYMoWZ5cBeYQk3Dr5pMjBsWEiwTtMm2QYLQMyHrVD9BMmq8pZWnx8TAxRt",
+        "slot": 478176267
+      },
+      "settlement": {
+        "signature": "3k8Usa12jhcQPxGYkjsqE5T9Ens4h3RHoiL8yH5cqfkoHmac7q6bch97FTfxetSAyLL2cNp41eF4g2uQcvqUM6D5",
+        "slot": 478176300
+      }
+    },
+    "accounts": {
+      "fee_payer": "8gbaJEfM5VDs9BpFLgwMTq7s2FkVpEri8ZnPbxn4HPqY",
+      "operator": "7RGprqHv1StDYede71xwKEbzASS9YDbMQKYWJCTBHX3E",
+      "pool": "2fhQqgYgQo1uFHExx4Kj4XdNtJ2Ff4UUEY3tEaubUbgW",
+      "epoch": "85Zav1gJmK8SBxs5MyD33WVYrKtGKe7jP8XRuBn7P7vA",
+      "vault_authority": "DwWyhcyQF4Pt1dEVHzjbwKt7a9WDYXkjR1PAwTUFGvSf",
+      "base_mint": "3wmTdziuTwgFFqiD5GnKsM2DJe9NEccjndmYkKsQxvY3",
+      "quote_mint": "Adpubmbx74QSBsgadELLid62gTBmdwNyhfKzLDqwg1nh",
+      "pool_base_vault": "5ARudGFJqgwW1uU3a2MvgKFkNji1ZASmS27gdgKT4ATW",
+      "pool_quote_vault": "4v9q9wPoAffhoZDJsQ4byNDZc6X9BHdX7YtheJcrurRe",
+      "venue_authority": "5kXygYDUh5szCKhZqRnxoZzhpWZ69MYBCy9RXxKZgHK5",
+      "venue_base_account": "EuCXSygzKCGqdnRQFUsD5g5SHjRHSm4KRPPsGcdBt9cx",
+      "venue_quote_account": "3BKpcK7uwYXDk8zoVitDeVFoLa7diN89ALCtRTrM6VsY",
+      "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    },
+    "configuration": {
+      "epoch_id": "fd9b1f79d6cd87cff16bd250f79a91e1f8c7a80fde5a4303192847553441ead2",
+      "minimum_count": 4,
+      "member_count": 4,
+      "lock_threshold": 2,
+      "settlement_threshold": 2,
+      "keypers": [
+        "BGXbo9vefR1ZSdtit7xWzofJt6h1oJ9NizK6yCTkpYT6",
+        "9KwRRr125QVfvsNeSUBgFF6BtxhH7qMGG2Jgg7Kp2cHM",
+        "2Jw5U2AAJ8C4PYZewyRZJ3kTtWaJWkFqC7MbLyK4rmVo"
+      ],
+      "base_lot_atoms": 1,
+      "quote_atoms_per_lot": 100
+    },
+    "commitments": {
+      "configuration_hash": "5f02accf43a1f20dcad261d52e54a6e154e37a110f2792b15c0d81a6a217c933",
+      "pre_balance_root": "796dd2d55708319ced7137da8f618d73414cdf9a9b877674d4448d53db6680c8",
+      "member_set": "35a6d2a278b5a54b3e18a017f11279a5ff2f4158fc9f62c715951f203554c090",
+      "lock_digest": "fa274cbf99b9754ae528e79783d478a57d47e35fa271a286d9928438a5491bd0",
+      "result": "7ebffd9e026fda19a433a0146a85449c7b0455cc645daddf2a347315c59bb1ad",
+      "settlement_digest": "fca56e33550dc6f87e7b9c7f14c85f6d22b5b298cb334ddd856ae3143f91adeb",
+      "local_transcript_sha256": "899c255efac030122f7a76bd17dee3e417a25a1a9e84cc2b9ca35fbbd00f09b7"
+    },
+    "token_balances": {
+      "pool_base_before": 4,
+      "pool_base_after": 6,
+      "pool_quote_before": 400,
+      "pool_quote_after": 200,
+      "venue_base_before": 10,
+      "venue_base_after": 8,
+      "venue_quote_before": 0,
+      "venue_quote_after": 200
+    },
+    "decoded_allowlist": [
+      {
+        "transaction": "funding-0",
+        "position": 0,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-base",
+        "digest": null
+      },
+      {
+        "transaction": "funding-0",
+        "position": 1,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-quote",
+        "digest": null
+      },
+      {
+        "transaction": "funding-1",
+        "position": 0,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-base",
+        "digest": null
+      },
+      {
+        "transaction": "funding-1",
+        "position": 1,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-quote",
+        "digest": null
+      },
+      {
+        "transaction": "funding-2",
+        "position": 0,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-base",
+        "digest": null
+      },
+      {
+        "transaction": "funding-2",
+        "position": 1,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-quote",
+        "digest": null
+      },
+      {
+        "transaction": "funding-3",
+        "position": 0,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-base",
+        "digest": null
+      },
+      {
+        "transaction": "funding-3",
+        "position": 1,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "pool-funding-quote",
+        "digest": null
+      },
+      {
+        "transaction": "lock",
+        "position": 0,
+        "program": "Ed25519SigVerify111111111111111111111111111",
+        "kind": "keyper-lock-approval",
+        "digest": "fa274cbf99b9754ae528e79783d478a57d47e35fa271a286d9928438a5491bd0"
+      },
+      {
+        "transaction": "lock",
+        "position": 1,
+        "program": "Ed25519SigVerify111111111111111111111111111",
+        "kind": "keyper-lock-approval",
+        "digest": "fa274cbf99b9754ae528e79783d478a57d47e35fa271a286d9928438a5491bd0"
+      },
+      {
+        "transaction": "lock",
+        "position": 2,
+        "program": "HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77",
+        "kind": "epoch-lock",
+        "digest": "fa274cbf99b9754ae528e79783d478a57d47e35fa271a286d9928438a5491bd0"
+      },
+      {
+        "transaction": "settlement",
+        "position": 0,
+        "program": "Ed25519SigVerify111111111111111111111111111",
+        "kind": "keyper-settlement-approval",
+        "digest": "fca56e33550dc6f87e7b9c7f14c85f6d22b5b298cb334ddd856ae3143f91adeb"
+      },
+      {
+        "transaction": "settlement",
+        "position": 1,
+        "program": "Ed25519SigVerify111111111111111111111111111",
+        "kind": "keyper-settlement-approval",
+        "digest": "fca56e33550dc6f87e7b9c7f14c85f6d22b5b298cb334ddd856ae3143f91adeb"
+      },
+      {
+        "transaction": "settlement",
+        "position": 2,
+        "program": "HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77",
+        "kind": "aggregate-settlement",
+        "digest": "fca56e33550dc6f87e7b9c7f14c85f6d22b5b298cb334ddd856ae3143f91adeb"
+      },
+      {
+        "transaction": "settlement",
+        "position": 3,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "aggregate-quote-leg",
+        "digest": null
+      },
+      {
+        "transaction": "settlement",
+        "position": 4,
+        "program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "kind": "aggregate-base-leg",
+        "digest": null
+      }
+    ],
+    "explorer_links": [
+      "https://explorer.solana.com/tx/7K4q5T4H27t2fb25jw4k5Y2sxb2f4diPYKkTKL4UcXVPa7Lr9xX6cDhgYmaaBLQByvj2RMsiAtUb8jRv4bFS1y9?cluster=devnet",
+      "https://explorer.solana.com/tx/2E2VaURsbkScwn2h9nCobZAzUgDMXmxEP9Y5Gm8EhTDpBjnhJn4T6FmroNhw1wY2ZMjRmGgNSZ3sxvDFDQ2QRwNc?cluster=devnet",
+      "https://explorer.solana.com/tx/YsnmSXS4c9kEJrZmJnXd7Vxo7LVqnGMDaZieRz2o1vV9mYM2TJPFyHZBkw1cjsUfwArhCXvtV2QHc5wmbniGQ6X?cluster=devnet",
+      "https://explorer.solana.com/tx/bESf5r588twaeeGG6XMmXFLGhrwJe4aThmzyRKZFVvBdwYukphxcmZfFrvWwXX4vukjrDb1mNeGfbRBwUVzLtmY?cluster=devnet",
+      "https://explorer.solana.com/tx/4N1kxRiW7KZ4G8WN5WqPkSG6aX1y8xHYMoWZ5cBeYQk3Dr5pMjBsWEiwTtMm2QYLQMyHrVD9BMmq8pZWnx8TAxRt?cluster=devnet",
+      "https://explorer.solana.com/tx/3k8Usa12jhcQPxGYkjsqE5T9Ens4h3RHoiL8yH5cqfkoHmac7q6bch97FTfxetSAyLL2cNp41eF4g2uQcvqUM6D5?cluster=devnet"
+    ]
+  },
+  "evidence_sha256": "93e0431db99e154382af2fadba6a9e60bd1bfea50096e115401a3e601d8f2198"
+}
