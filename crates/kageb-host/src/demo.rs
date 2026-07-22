@@ -49,7 +49,9 @@ use solana_transaction_status_client_types::{
 use tempfile::TempDir;
 use threshold_crypto::serde_impl::SerdeSecret;
 
-use crate::evidence::{build_canonical_checkpoint, CanonicalCheckpointV1};
+use crate::evidence::{
+    build_canonical_checkpoint, read_verified_checkpoint, CanonicalCheckpointV1,
+};
 use crate::{
     admit_batch, content_root, extract_upgradeable_program, net_batch, run_keyper_release_share,
     run_keyper_sign_lock, run_keyper_sign_settlement, AdmissionPolicyV1, BalanceRecordV1,
@@ -849,6 +851,7 @@ pub fn devnet_proof(
     program: &str,
     out: &Path,
     rpc_url: &str,
+    checkpoint_artifact: Option<&Path>,
 ) -> Result<String, String> {
     let program = program
         .parse::<Pubkey>()
@@ -859,7 +862,7 @@ pub fn devnet_proof(
     if out.exists() {
         return Err("refusing to overwrite existing evidence".to_owned());
     }
-    let (public_commit, checkpoint) = clean_public_checkpoint_artifact()?;
+    let (public_commit, checkpoint) = clean_public_checkpoint_artifact(checkpoint_artifact)?;
     let artifact = checkpoint.artifact;
     let build_toolchain = checkpoint.build_toolchain;
     let checkpoint_artifact_sha256 = hex_sha256(&artifact);
@@ -1425,7 +1428,9 @@ pub fn devnet_proof(
     ))
 }
 
-fn clean_public_checkpoint_artifact() -> Result<(String, CanonicalCheckpointV1), String> {
+fn clean_public_checkpoint_artifact(
+    checkpoint_artifact: Option<&Path>,
+) -> Result<(String, CanonicalCheckpointV1), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
@@ -1446,7 +1451,10 @@ fn clean_public_checkpoint_artifact() -> Result<(String, CanonicalCheckpointV1),
     )?
     .trim()
     .to_owned();
-    let checkpoint = build_canonical_checkpoint(&commit)?;
+    let checkpoint = match checkpoint_artifact {
+        Some(path) => read_verified_checkpoint(&root, path)?,
+        None => build_canonical_checkpoint(&commit)?,
+    };
     Ok((commit, checkpoint))
 }
 

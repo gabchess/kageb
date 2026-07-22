@@ -129,8 +129,10 @@ fn devnet_cli_requires_the_fixed_program_and_explicit_paths() {
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr
-        .contains("kageb demo devnet --payer <path> --program <id> --out <path> [--rpc <url>]"));
+    assert!(stderr.contains(
+        "kageb demo devnet --payer <path> --program <id> --out <path> \
+[--checkpoint-artifact <path>] [--rpc <url>]"
+    ));
     assert!(!stderr.contains("safe for real funds"));
 }
 

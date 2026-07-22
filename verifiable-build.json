@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "solana_verify": "solana-verify 0.5.1",
+  "build_image": "solanafoundation/solana-verifiable-build@sha256:6c73adc767ee7ff212f2532d4695472b12f3d4ac20aea3db22b89d8c614dac50"
+}

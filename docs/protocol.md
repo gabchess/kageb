@@ -137,8 +137,8 @@ Abort and expiry change epoch state. They do not transfer or refund tokens.
 
 [`evidence/devnet.json`](../evidence/devnet.json) is a strict v1 document. Unknown fields fail. Its content hash covers the canonical serialized content, including:
 
-- the public source commit and build toolchain;
-- local and deployed SBF hashes;
+- the public source commit, Solana Verify version, and pinned build-image digest;
+- verifiable-build and deployed SBF hashes;
 - program, ProgramData, loader, slot, and upgrade authority;
 - four funding transactions, one lock, and one settlement;
 - all relevant accounts and protocol configuration;
@@ -146,7 +146,7 @@ Abort and expiry change epoch state. They do not transfer or refund tokens.
 - before and after pool and venue token balances;
 - the exact decoded instruction allowlist.
 
-The standalone verifier fetches finalized Devnet state, checks transaction order, reconstructs the allowed instructions, checks balance conservation and program identity, rebuilds the recorded source commit, and compares the SBF executable hash.
+The standalone verifier fetches finalized Devnet state, checks transaction order, reconstructs the allowed instructions, checks balance conservation and program identity, rebuilds the recorded source commit in the pinned container, and compares every SBF byte with ProgramData.
 
 The file is content-addressed and tamper-evident. A hash is not a signature. The proof remains scoped to the recorded run and observer model.
 

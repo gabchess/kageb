@@ -3,7 +3,8 @@ use std::{env, path::Path, process::ExitCode};
 const DEFAULT_DEVNET_RPC: &str = "https://api.devnet.solana.com";
 const USAGE: &str =
     "usage: kageb client prepare --keypair <path> | kageb trace | kageb demo local | \
-kageb demo devnet --payer <path> --program <id> --out <path> [--rpc <url>] | \
+kageb demo devnet --payer <path> --program <id> --out <path> \
+[--checkpoint-artifact <path>] [--rpc <url>] | \
 kageb verify evidence <path> [--rpc <url>]";
 const CLIENT_PREPARE_HELP: &str = r#"usage: kageb client prepare --keypair <path>
 
@@ -122,7 +123,7 @@ fn main() -> ExitCode {
                 && program_flag == "--program"
                 && out_flag == "--out" =>
         {
-            demo_devnet(payer, program, out, DEFAULT_DEVNET_RPC)
+            demo_devnet(payer, program, out, DEFAULT_DEVNET_RPC, None)
         }
         [group, command, payer_flag, payer, program_flag, program, out_flag, out, rpc_flag, rpc]
             if group == "demo"
@@ -132,7 +133,28 @@ fn main() -> ExitCode {
                 && out_flag == "--out"
                 && rpc_flag == "--rpc" =>
         {
-            demo_devnet(payer, program, out, rpc)
+            demo_devnet(payer, program, out, rpc, None)
+        }
+        [group, command, payer_flag, payer, program_flag, program, out_flag, out, checkpoint_flag, checkpoint]
+            if group == "demo"
+                && command == "devnet"
+                && payer_flag == "--payer"
+                && program_flag == "--program"
+                && out_flag == "--out"
+                && checkpoint_flag == "--checkpoint-artifact" =>
+        {
+            demo_devnet(payer, program, out, DEFAULT_DEVNET_RPC, Some(checkpoint))
+        }
+        [group, command, payer_flag, payer, program_flag, program, out_flag, out, checkpoint_flag, checkpoint, rpc_flag, rpc]
+            if group == "demo"
+                && command == "devnet"
+                && payer_flag == "--payer"
+                && program_flag == "--program"
+                && out_flag == "--out"
+                && checkpoint_flag == "--checkpoint-artifact"
+                && rpc_flag == "--rpc" =>
+        {
+            demo_devnet(payer, program, out, rpc, Some(checkpoint))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -154,9 +176,21 @@ fn verify_evidence(path: &str, rpc: &str) -> ExitCode {
     }
 }
 
-fn demo_devnet(payer: &str, program: &str, out: &str, rpc: &str) -> ExitCode {
+fn demo_devnet(
+    payer: &str,
+    program: &str,
+    out: &str,
+    rpc: &str,
+    checkpoint: Option<&str>,
+) -> ExitCode {
     eprintln!("WARNING: synthetic assets only; this prototype is not safe for real funds.");
-    match kageb::devnet_proof(Path::new(payer), program, Path::new(out), rpc) {
+    match kageb::devnet_proof(
+        Path::new(payer),
+        program,
+        Path::new(out),
+        rpc,
+        checkpoint.map(Path::new),
+    ) {
         Ok(output) => {
             print!("{output}");
             ExitCode::SUCCESS

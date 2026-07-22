@@ -40,11 +40,8 @@ fn content() -> DevnetEvidenceContentV1 {
         cluster: "devnet".to_owned(),
         public_commit: "1".repeat(40),
         build_toolchain: EvidenceBuildToolchainV1 {
-            host_rustc: "rustc 1.95.0".to_owned(),
-            cargo_build_sbf: "cargo-build-sbf 4.0.0".to_owned(),
-            platform_tools: "platform-tools v1.53".to_owned(),
-            sbf_rustc: "rustc 1.89.0".to_owned(),
-            solana_cli: "solana-cli 4.0.1".to_owned(),
+            solana_verify: "solana-verify 0.5.1".to_owned(),
+            build_image: "solanafoundation/solana-verifiable-build@sha256:test".to_owned(),
         },
         checkpoint_artifact_len: 187_872,
         checkpoint_artifact_sha256: digest(1),

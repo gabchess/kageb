@@ -72,11 +72,14 @@ It does not prove unique humans, production anonymity, private funding or withdr
 
 The public evidence records four funded participants, a 4-of-4 crowd lock, a 2-of-3 keyper quorum, and one aggregate `BUY 2 lots` settlement.
 
+Full source verification needs Docker and `solana-verify` 0.5.1. KageB builds the cited commit inside the official Solana 4.0.1 verifiable-build image pinned in [`verifiable-build.json`](verifiable-build.json).
+
 ```sh
+cargo install solana-verify --version 0.5.1 --locked
 ./scripts/verify-public-evidence.sh
 ```
 
-The verifier does more than parse JSON. It checks the content hash, fetches finalized Devnet transactions and accounts, validates the instruction allowlist and token conservation, checks the provisional upgrade authority, rebuilds the recorded public commit, and compares its SBF executable hash with the deployed executable.
+The verifier checks the content hash, fetches finalized Devnet transactions and accounts, validates the instruction allowlist and token conservation, checks the provisional upgrade authority, rebuilds the recorded public commit in the pinned container, and compares every byte with the deployed executable.
 
 Expected result:
 
@@ -137,6 +140,15 @@ Read [the protocol guide](docs/protocol.md) for the state machine and [SECURITY.
 ```
 
 This runs formatting, clippy, tests, docs, SBF builds, the local proof, toolchain checks, license checks, and the public-file scanner. The Devnet verifier is a separate networked check.
+
+Build the deployable, reproducible SBF artifact with:
+
+```sh
+cargo install solana-verify --version 0.5.1 --locked
+./scripts/verifiable-build.sh
+```
+
+Do not deploy the output of a plain `cargo build-sbf` command. Solana program builds can differ across host systems. The Devnet evidence binds the pinned container output to the public source commit and ProgramData bytes.
 
 ## License
 

@@ -66,11 +66,16 @@ pub struct DevnetEvidenceContentV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceBuildToolchainV1 {
-    pub host_rustc: String,
-    pub cargo_build_sbf: String,
-    pub platform_tools: String,
-    pub sbf_rustc: String,
-    pub solana_cli: String,
+    pub solana_verify: String,
+    pub build_image: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiableBuildConfigV1 {
+    schema_version: u8,
+    solana_verify: String,
+    build_image: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -387,11 +392,8 @@ fn validate_public_fields(
         return Err(DevnetEvidenceError::InvalidPublicField);
     }
     for identity in [
-        &evidence.build_toolchain.host_rustc,
-        &evidence.build_toolchain.cargo_build_sbf,
-        &evidence.build_toolchain.platform_tools,
-        &evidence.build_toolchain.sbf_rustc,
-        &evidence.build_toolchain.solana_cli,
+        &evidence.build_toolchain.solana_verify,
+        &evidence.build_toolchain.build_image,
     ] {
         if identity.is_empty()
             || identity.len() > 128
@@ -1082,65 +1084,33 @@ pub(crate) fn build_canonical_checkpoint(commit: &str) -> Result<CanonicalCheckp
     {
         return Err("canonical checkpoint checkout is not clean".to_owned());
     }
-
-    let cargo = crate::demo::resolve_cargo().map_err(|_| "resolve cargo failed".to_owned())?;
+    let build_toolchain = read_verifiable_build_config(&checkout)?;
+    let solana_verify = crate::demo::resolve_on_path("solana-verify")
+        .map_err(|_| "resolve solana-verify failed".to_owned())?;
+    let observed_version = command_output(
+        std::process::Command::new(&solana_verify)
+            .arg("--version")
+            .current_dir(&checkout),
+        "read solana-verify identity",
+    )?;
+    if observed_version.trim() != build_toolchain.solana_verify {
+        return Err(format!(
+            "solana-verify identity differs from checkpoint config: expected {:?}, observed {:?}",
+            build_toolchain.solana_verify,
+            observed_version.trim()
+        ));
+    }
     command_output(
-        std::process::Command::new(&cargo)
-            .args(["build-sbf", "--manifest-path"])
-            .arg(checkout.join("crates/kageb-program/Cargo.toml"))
-            .args(["--", "--locked"])
+        std::process::Command::new(&solana_verify)
+            .arg("build")
+            .arg(&checkout)
+            .arg("--workspace-path")
+            .arg(&checkout)
+            .args(["--library-name", "kageb_program", "--base-image"])
+            .arg(&build_toolchain.build_image)
             .current_dir(&checkout),
         "build canonical checkpoint",
     )?;
-    let build_versions = command_output(
-        std::process::Command::new(&cargo)
-            .args(["build-sbf", "--version"])
-            .current_dir(&checkout),
-        "read SBF build identity",
-    )?;
-    let mut build_versions = build_versions.lines();
-    let cargo_build_sbf = build_versions
-        .next()
-        .filter(|line| line.starts_with("cargo-build-sbf "))
-        .ok_or("invalid cargo-build-sbf identity")?
-        .to_owned();
-    let platform_tools = build_versions
-        .next()
-        .filter(|line| line.starts_with("platform-tools "))
-        .ok_or("invalid platform-tools identity")?
-        .to_owned();
-    let sbf_rustc = build_versions
-        .next()
-        .filter(|line| line.starts_with("rustc "))
-        .ok_or("invalid SBF rustc identity")?
-        .to_owned();
-    let rustc_next_to_cargo = cargo
-        .parent()
-        .map(|parent| parent.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }))
-        .filter(|candidate| candidate.is_file());
-    let rustc = match rustc_next_to_cargo {
-        Some(rustc) => rustc,
-        None => crate::demo::resolve_on_path("rustc")
-            .map_err(|_| "resolve host rustc failed".to_owned())?,
-    };
-    let host_rustc = command_output(
-        std::process::Command::new(rustc)
-            .arg("--version")
-            .current_dir(&checkout),
-        "read host Rust identity",
-    )?
-    .trim()
-    .to_owned();
-    let solana = crate::demo::resolve_on_path("solana")
-        .map_err(|_| "resolve Solana CLI failed".to_owned())?;
-    let solana_cli = command_output(
-        std::process::Command::new(solana)
-            .arg("--version")
-            .current_dir(&checkout),
-        "read Solana CLI identity",
-    )?
-    .trim()
-    .to_owned();
     let artifact = std::fs::read(checkout.join("target/deploy/kageb_program.so"))
         .map_err(|_| "read canonical checkpoint artifact failed".to_owned())?;
     if !artifact.starts_with(b"\x7fELF") {
@@ -1148,13 +1118,63 @@ pub(crate) fn build_canonical_checkpoint(commit: &str) -> Result<CanonicalCheckp
     }
     Ok(CanonicalCheckpointV1 {
         artifact,
-        build_toolchain: EvidenceBuildToolchainV1 {
-            host_rustc,
-            cargo_build_sbf,
-            platform_tools,
-            sbf_rustc,
-            solana_cli,
-        },
+        build_toolchain,
+    })
+}
+
+pub(crate) fn read_verified_checkpoint(
+    root: &Path,
+    path: &Path,
+) -> Result<CanonicalCheckpointV1, String> {
+    const MAX_CHECKPOINT_BYTES: u64 = 2 * 1024 * 1024;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options
+        .open(path)
+        .map_err(|_| "read verified checkpoint failed".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "read verified checkpoint metadata failed".to_owned())?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
+        return Err("regular verified checkpoint within size limit required".to_owned());
+    }
+    let mut artifact = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut artifact)
+        .map_err(|_| "read verified checkpoint failed".to_owned())?;
+    if !artifact.starts_with(b"\x7fELF") {
+        return Err("verified checkpoint artifact is not ELF".to_owned());
+    }
+    Ok(CanonicalCheckpointV1 {
+        artifact,
+        build_toolchain: read_verifiable_build_config(root)?,
+    })
+}
+
+fn read_verifiable_build_config(root: &Path) -> Result<EvidenceBuildToolchainV1, String> {
+    let encoded = std::fs::read(root.join("verifiable-build.json"))
+        .map_err(|_| "read verifiable build config failed".to_owned())?;
+    let config: VerifiableBuildConfigV1 = serde_json::from_slice(&encoded)
+        .map_err(|_| "parse verifiable build config failed".to_owned())?;
+    if config.schema_version != 1
+        || config.solana_verify != "solana-verify 0.5.1"
+        || !config
+            .build_image
+            .starts_with("solanafoundation/solana-verifiable-build@sha256:")
+        || config.build_image.len() != "solanafoundation/solana-verifiable-build@sha256:".len() + 64
+        || !config
+            .build_image
+            .rsplit_once(':')
+            .map(|(_, digest)| digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .unwrap_or(false)
+    {
+        return Err("invalid verifiable build config".to_owned());
+    }
+    Ok(EvidenceBuildToolchainV1 {
+        solana_verify: config.solana_verify,
+        build_image: config.build_image,
     })
 }
 
@@ -1205,19 +1225,13 @@ fn build_toolchain_mismatch(
     expected: &EvidenceBuildToolchainV1,
     observed: &EvidenceBuildToolchainV1,
 ) -> Option<String> {
-    let exact_mismatch = [
-        ("host_rustc", &expected.host_rustc, &observed.host_rustc),
+    [
         (
-            "cargo_build_sbf",
-            &expected.cargo_build_sbf,
-            &observed.cargo_build_sbf,
+            "solana_verify",
+            &expected.solana_verify,
+            &observed.solana_verify,
         ),
-        (
-            "platform_tools",
-            &expected.platform_tools,
-            &observed.platform_tools,
-        ),
-        ("sbf_rustc", &expected.sbf_rustc, &observed.sbf_rustc),
+        ("build_image", &expected.build_image, &observed.build_image),
     ]
     .into_iter()
     .find(|(_, expected, observed)| expected != observed)
@@ -1225,35 +1239,7 @@ fn build_toolchain_mismatch(
         format!(
             "canonical checkpoint {field} differs from evidence: expected {expected:?}, observed {observed:?}"
         )
-    });
-    if exact_mismatch.is_some() {
-        return exact_mismatch;
-    }
-
-    if solana_cli_release_identity(&expected.solana_cli)
-        != solana_cli_release_identity(&observed.solana_cli)
-    {
-        return Some(format!(
-            "canonical checkpoint solana_cli release differs from evidence: expected {:?}, observed {:?}",
-            expected.solana_cli, observed.solana_cli
-        ));
-    }
-    None
-}
-
-fn solana_cli_release_identity(identity: &str) -> Option<(&str, &str)> {
-    let mut fields = identity.split_ascii_whitespace();
-    let name = fields.next()?;
-    let version = fields.next()?;
-    if name != "solana-cli"
-        || version.is_empty()
-        || !version
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return None;
-    }
-    Some((name, version))
+    })
 }
 
 fn read_evidence_input(path: &Path) -> Result<String, String> {
@@ -2516,36 +2502,19 @@ mod tests {
     #[test]
     fn build_toolchain_mismatch_names_the_first_changed_identity() {
         let expected = EvidenceBuildToolchainV1 {
-            host_rustc: "rustc 1.95.0".to_owned(),
-            cargo_build_sbf: "cargo-build-sbf 4.0.0".to_owned(),
-            platform_tools: "platform-tools v1.53".to_owned(),
-            sbf_rustc: "rustc 1.89.0".to_owned(),
-            solana_cli: "solana-cli 4.0.1".to_owned(),
+            solana_verify: "solana-verify 0.5.1".to_owned(),
+            build_image: "solanafoundation/solana-verifiable-build@sha256:test".to_owned(),
         };
         let mut observed = expected.clone();
-        observed.platform_tools = "platform-tools v1.54".to_owned();
+        observed.build_image = "solanafoundation/solana-verifiable-build@sha256:changed".to_owned();
 
         assert_eq!(
             build_toolchain_mismatch(&expected, &observed),
             Some(
-                "canonical checkpoint platform_tools differs from evidence: expected \"platform-tools v1.53\", observed \"platform-tools v1.54\""
+                "canonical checkpoint build_image differs from evidence: expected \"solanafoundation/solana-verifiable-build@sha256:test\", observed \"solanafoundation/solana-verifiable-build@sha256:changed\""
                     .to_owned()
             )
         );
         assert_eq!(build_toolchain_mismatch(&expected, &expected), None);
-
-        let mut linux_release = expected.clone();
-        linux_release.solana_cli =
-            "solana-cli 4.0.1 (src:252cbf3e; feat:dda54cf7, client:Agave)".to_owned();
-        assert_eq!(build_toolchain_mismatch(&expected, &linux_release), None);
-
-        linux_release.solana_cli = "solana-cli 4.0.2 (src:252cbf3e)".to_owned();
-        assert_eq!(
-            build_toolchain_mismatch(&expected, &linux_release),
-            Some(
-                "canonical checkpoint solana_cli release differs from evidence: expected \"solana-cli 4.0.1\", observed \"solana-cli 4.0.2 (src:252cbf3e)\""
-                    .to_owned()
-            )
-        );
     }
 }

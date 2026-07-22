@@ -40,6 +40,10 @@ Those crates run in tests, not in the KageB client, coordinator, keyper, or onch
 
 The evidence verifier proves one recorded run under this boundary. It does not audit all future code or deployments.
 
+## Build trust
+
+The Devnet executable comes from `solana-verify` 0.5.1 and the official Solana 4.0.1 verifiable-build image pinned by digest in `verifiable-build.json`. The verifier rebuilds the cited public commit in that container and requires an exact ProgramData match. This proves source identity, not code safety. The build still trusts the pinned container and its installed tools.
+
 ## Report a vulnerability
 
 Do not post secrets or working exploit details in a public issue. Open a short issue asking for a private contact channel, without the sensitive details. Include the affected commit, component, and impact once a private channel is agreed.
