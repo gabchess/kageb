@@ -118,12 +118,20 @@ fn required_peak_balance(
         .setup
         .checked_add(rents.fees)
         .ok_or("devnet peak balance overflow")?;
-    if action != DevnetDeploymentAction::Noop {
-        required = required
-            .checked_add(rents.program)
-            .and_then(|value| value.checked_add(rents.programdata))
-            .and_then(|value| value.checked_add(rents.buffer))
-            .ok_or("devnet peak balance overflow")?;
+    match action {
+        DevnetDeploymentAction::Noop => {}
+        DevnetDeploymentAction::Upgrade => {
+            required = required
+                .checked_add(rents.buffer)
+                .ok_or("devnet peak balance overflow")?;
+        }
+        DevnetDeploymentAction::Initial => {
+            required = required
+                .checked_add(rents.program)
+                .and_then(|value| value.checked_add(rents.programdata))
+                .and_then(|value| value.checked_add(rents.buffer))
+                .ok_or("devnet peak balance overflow")?;
+        }
     }
     Ok(required)
 }
@@ -3248,6 +3256,10 @@ mod devnet_tests {
         assert_eq!(
             required_peak_balance(DevnetDeploymentAction::Initial, rents),
             Ok(150)
+        );
+        assert_eq!(
+            required_peak_balance(DevnetDeploymentAction::Upgrade, rents),
+            Ok(100)
         );
         assert!(required_peak_balance(
             DevnetDeploymentAction::Initial,
