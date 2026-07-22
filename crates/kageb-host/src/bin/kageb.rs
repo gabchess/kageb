@@ -1,13 +1,59 @@
 use std::{env, path::Path, process::ExitCode};
 
 const DEFAULT_DEVNET_RPC: &str = "https://api.devnet.solana.com";
-const USAGE: &str = "usage: kageb trace | kageb demo local | \
+const USAGE: &str =
+    "usage: kageb client prepare --keypair <path> | kageb trace | kageb demo local | \
 kageb demo devnet --payer <path> --program <id> --out <path> [--rpc <url>] | \
 kageb verify evidence <path> [--rpc <url>]";
+const CLIENT_PREPARE_HELP: &str = r#"usage: kageb client prepare --keypair <path>
+
+Reads one JSON object from stdin (maximum 16384 bytes; unknown fields rejected).
+
+Request schema v1:
+{
+  "schema_version": 1,
+  "side": "buy" | "sell",
+  "limit_price": <nonzero u64>,
+  "epoch_id": "<canonical base58 encoding of 32 bytes>",
+  "participant_id": "<canonical base58 encoding of 32 bytes>",
+  "funded_authorization_base64": "<canonical padded base64 wire>",
+  "epoch_public_keys_base64": "<canonical padded base64 wire>"
+}
+
+Response schema v1:
+{
+  "schema_version": 1,
+  "epoch_id": "<canonical base58 encoding of 32 bytes>",
+  "participant_id": "<canonical base58 encoding of 32 bytes>",
+  "trading_key": "<canonical base58 encoding of 32 bytes>",
+  "ciphertext_sha256_base64": "<canonical padded base64 digest>",
+  "submission_sha256_base64": "<canonical padded base64 digest>",
+  "encrypted_submission_base64": "<canonical padded base64 wire>"
+}
+
+The authorization epoch, participant, and trading key must match the request and keypair.
+The coordinator remains authoritative for admission.
+The keypair must be an exact regular non-symlink Solana JSON key file with Unix mode 0600.
+"#;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     match arguments.as_slice() {
+        [group, command, help] if group == "client" && command == "prepare" && help == "--help" => {
+            print!("{CLIENT_PREPARE_HELP}");
+            ExitCode::SUCCESS
+        }
+        [group, command, keypair_flag, keypair]
+            if group == "client" && command == "prepare" && keypair_flag == "--keypair" =>
+        {
+            match kageb::handle_client_prepare(Path::new(keypair)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("client prepare rejected: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         [group, command] if group == "keyper" && command == "self-test" => {
             match kageb::handle_keyper_self_test() {
                 Ok(()) => ExitCode::SUCCESS,

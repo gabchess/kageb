@@ -1,6 +1,7 @@
 //! Host-side KageB protocol types.
 
 mod admission;
+mod client;
 mod commitment;
 mod crypto;
 mod demo;
@@ -15,6 +16,7 @@ pub use admission::{
     JournalError, ReservationJournal, ReservationRecord, ReservationState, SubmissionV1,
     SuspensionError, SuspensionRegistry, UnsignedFundedAuthorizationV1,
 };
+pub use client::{handle_client_prepare, ClientPrepareError};
 pub use commitment::{content_root, CommitmentDomain, CommitmentError};
 pub use crypto::{
     admit_batch, AdmissionPolicyV1, AdmittedBatch, CryptoError, EncryptedIntentV1,

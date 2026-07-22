@@ -395,13 +395,13 @@ impl fmt::Debug for EpochPublicKeys {
 }
 
 impl EpochPublicKeys {
-    pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, CryptoError> {
+    pub fn encode_wire(&self) -> Result<Vec<u8>, CryptoError> {
         codec()
             .serialize(&self.keys)
             .map_err(|_| CryptoError::InvalidShare)
     }
 
-    pub(crate) fn decode_wire(encoded: &[u8]) -> Result<Self, CryptoError> {
+    pub fn decode_wire(encoded: &[u8]) -> Result<Self, CryptoError> {
         let keys: PublicKeySet = codec()
             .with_limit(1_024)
             .deserialize(encoded)
@@ -864,7 +864,7 @@ impl EncryptedSubmissionV1 {
         bytes
     }
 
-    pub(crate) fn encode_wire(&self) -> Vec<u8> {
+    pub fn encode_wire(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(ENCRYPTED_SUBMISSION_V1_LEN);
         bytes.extend_from_slice(&self.authorization.encode());
         bytes.extend_from_slice(&self.ciphertext);
@@ -873,7 +873,7 @@ impl EncryptedSubmissionV1 {
         bytes
     }
 
-    pub(crate) fn decode_wire(bytes: &[u8]) -> Result<Self, CryptoError> {
+    pub fn decode_wire(bytes: &[u8]) -> Result<Self, CryptoError> {
         if bytes.len() != ENCRYPTED_SUBMISSION_V1_LEN {
             return Err(CryptoError::InvalidCiphertext);
         }
