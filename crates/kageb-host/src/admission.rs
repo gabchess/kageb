@@ -68,6 +68,15 @@ impl UnsignedFundedAuthorizationV1 {
     pub const fn participant_id(&self) -> [u8; 32] {
         self.participant_id
     }
+
+    pub(crate) const fn into_parts(self) -> ([u8; 32], [u8; 32], u64, u64) {
+        (
+            self.nonce,
+            self.participant_id,
+            self.base_atoms,
+            self.quote_atoms,
+        )
+    }
 }
 
 /// Unsigned envelope that Task 2 will authenticate and encrypt.

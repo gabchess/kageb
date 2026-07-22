@@ -109,6 +109,11 @@ impl IntentBodyV1 {
     }
 
     #[must_use]
+    pub fn epoch_id(&self) -> [u8; 32] {
+        self.epoch_id
+    }
+
+    #[must_use]
     pub fn encode(&self) -> [u8; INTENT_LEN] {
         let mut bytes = [0_u8; INTENT_LEN];
         bytes[0] = INTENT_VERSION;
