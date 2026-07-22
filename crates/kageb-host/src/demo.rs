@@ -1758,13 +1758,34 @@ where
     } else {
         false
     };
-    let signer_cleanup = signer_directory.close();
+    let signer_cleanup_failed = signer_directory.close().is_err();
+    finish_deploy_attempt(
+        deploy_status,
+        buffer_cleanup_failed,
+        signer_cleanup_failed,
+        buffer_pubkey,
+    )
+}
+
+fn finish_deploy_attempt(
+    deploy_status: Result<bool, ()>,
+    buffer_cleanup_failed: bool,
+    signer_cleanup_failed: bool,
+    buffer_pubkey: Pubkey,
+) -> Result<(), String> {
+    if signer_cleanup_failed {
+        if buffer_cleanup_failed {
+            return Err(format!(
+                "Solana program deploy failed; buffer cleanup failed: {buffer_pubkey}; private signer cleanup also failed"
+            ));
+        }
+        return Err("remove private deploy signer files failed".to_owned());
+    }
     if buffer_cleanup_failed {
         return Err(format!(
             "Solana program deploy failed; buffer cleanup failed: {buffer_pubkey}"
         ));
     }
-    signer_cleanup.map_err(|_| "remove private deploy signer files failed".to_owned())?;
     match deploy_status {
         Ok(true) => Ok(()),
         Ok(false) => Err("Solana program deploy failed".to_owned()),
@@ -3355,6 +3376,18 @@ mod devnet_tests {
         );
         assert_eq!(invocation, 2);
         assert!(signer_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn deploy_reports_buffer_and_private_signer_cleanup_failures_together() {
+        let buffer = Pubkey::new_unique();
+
+        assert_eq!(
+            finish_deploy_attempt(Err(()), true, true, buffer),
+            Err(format!(
+                "Solana program deploy failed; buffer cleanup failed: {buffer}; private signer cleanup also failed"
+            ))
+        );
     }
 
     #[cfg(unix)]
