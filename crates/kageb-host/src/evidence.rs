@@ -1221,6 +1221,44 @@ pub fn verify_evidence_file(path: &Path, rpc_url: &str) -> Result<String, String
     ))
 }
 
+pub fn verify_evidence_file_with_checkpoint(
+    path: &Path,
+    checkpoint_path: &Path,
+    rpc_url: &str,
+) -> Result<String, String> {
+    let json = read_evidence_input(path)?;
+    let bundle = DevnetEvidenceBundleV1::from_json(&json)
+        .map_err(|error| format!("parse evidence: {error:?}"))?;
+    bundle
+        .verify_content_hash()
+        .map_err(|error| format!("verify evidence content address: {error:?}"))?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let checkpoint = read_verified_checkpoint(&root, checkpoint_path)?;
+    if let Some(mismatch) =
+        build_toolchain_mismatch(&bundle.content.build_toolchain, &checkpoint.build_toolchain)
+    {
+        return Err(mismatch);
+    }
+    let checkpoint_sha256 = hex_digest(Sha256::digest(&checkpoint.artifact));
+    if checkpoint.artifact.len() != bundle.content.checkpoint_artifact_len
+        || checkpoint_sha256 != bundle.content.checkpoint_artifact_sha256
+    {
+        return Err(format!(
+            "supplied checkpoint artifact differs from evidence: expected len {} sha256 {}, observed len {} sha256 {}",
+            bundle.content.checkpoint_artifact_len,
+            bundle.content.checkpoint_artifact_sha256,
+            checkpoint.artifact.len(),
+            checkpoint_sha256
+        ));
+    }
+    verify_devnet_evidence_at_rpc(&bundle, &checkpoint.artifact, rpc_url)
+        .map_err(|error| format!("verify finalized devnet evidence: {error:?}"))?;
+    Ok(format!(
+        "VERIFIED: evidence {} settlement {}\n",
+        bundle.evidence_sha256, bundle.content.transactions.settlement.signature
+    ))
+}
+
 fn build_toolchain_mismatch(
     expected: &EvidenceBuildToolchainV1,
     observed: &EvidenceBuildToolchainV1,

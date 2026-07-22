@@ -5,7 +5,7 @@ const USAGE: &str =
     "usage: kageb client prepare --keypair <path> | kageb trace | kageb demo local | \
 kageb demo devnet --payer <path> --program <id> --out <path> \
 [--checkpoint-artifact <path>] [--rpc <url>] | \
-kageb verify evidence <path> [--rpc <url>]";
+kageb verify evidence <path> [--checkpoint-artifact <path>] [--rpc <url>]";
 const CLIENT_PREPARE_HELP: &str = r#"usage: kageb client prepare --keypair <path>
 
 Reads one JSON object from stdin (maximum 16384 bytes; unknown fields rejected).
@@ -116,6 +116,21 @@ fn main() -> ExitCode {
         {
             verify_evidence(path, rpc)
         }
+        [group, command, path, checkpoint_flag, checkpoint]
+            if group == "verify"
+                && command == "evidence"
+                && checkpoint_flag == "--checkpoint-artifact" =>
+        {
+            verify_evidence_with_checkpoint(path, checkpoint, DEFAULT_DEVNET_RPC)
+        }
+        [group, command, path, checkpoint_flag, checkpoint, rpc_flag, rpc]
+            if group == "verify"
+                && command == "evidence"
+                && checkpoint_flag == "--checkpoint-artifact"
+                && rpc_flag == "--rpc" =>
+        {
+            verify_evidence_with_checkpoint(path, checkpoint, rpc)
+        }
         [group, command, payer_flag, payer, program_flag, program, out_flag, out]
             if group == "demo"
                 && command == "devnet"
@@ -165,6 +180,19 @@ fn main() -> ExitCode {
 
 fn verify_evidence(path: &str, rpc: &str) -> ExitCode {
     match kageb::verify_evidence_file(Path::new(path), rpc) {
+        Ok(output) => {
+            print!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn verify_evidence_with_checkpoint(path: &str, checkpoint: &str, rpc: &str) -> ExitCode {
+    match kageb::verify_evidence_file_with_checkpoint(Path::new(path), Path::new(checkpoint), rpc) {
         Ok(output) => {
             print!("{output}");
             ExitCode::SUCCESS

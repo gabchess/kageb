@@ -1429,7 +1429,15 @@ pub fn devnet_proof(
         .map_err(|error| format!("seal devnet evidence: {error:?}"))?;
     crate::verify_devnet_evidence_at_rpc(&bundle, &artifact, rpc_url)
         .map_err(|error| format!("verify devnet evidence before write: {error:?}"))?;
-    persist_verified_evidence(out, rpc_url, &bundle, &private_material)?;
+    let verification_artifact = run_directory.path().join("verification-checkpoint.so");
+    write_private_file(&verification_artifact, &artifact)?;
+    persist_verified_evidence(
+        out,
+        rpc_url,
+        &bundle,
+        &private_material,
+        &verification_artifact,
+    )?;
     Ok(format!(
         "LOCKED: crowd 4/4\nSETTLED: one aggregate BUY 2 lots\nVERIFIED: evidence {} settlement {}\n{NON_CLAIM}\n",
         bundle.evidence_sha256, settlement_signature
@@ -2047,6 +2055,7 @@ fn persist_verified_evidence(
     rpc_url: &str,
     bundle: &DevnetEvidenceBundleV1,
     private_material: &[Vec<u8>],
+    checkpoint_artifact: &Path,
 ) -> Result<(), String> {
     let mut bytes = bundle
         .to_json_pretty()
@@ -2059,6 +2068,8 @@ fn persist_verified_evidence(
         std::env::current_exe().map_err(|_| "locate fresh evidence verifier failed".to_owned())?;
     let mut child = Command::new(executable)
         .args(["verify", "evidence", "-"])
+        .arg("--checkpoint-artifact")
+        .arg(checkpoint_artifact)
         .args(["--rpc", rpc_url])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
