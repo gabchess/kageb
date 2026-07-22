@@ -1,7 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::OpenOptions,
+    io::Read,
+    path::Path,
     str::FromStr,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use kageb_program::wire::SettlementPayloadV1;
@@ -29,6 +35,7 @@ const EVIDENCE_BUNDLE_DOMAIN: &[u8] = b"KAGEB_EVIDENCE_BUNDLE_V1\0";
 pub const UPGRADEABLE_LOADER_ID: Pubkey =
     solana_program::pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
 pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+pub(crate) const CANONICAL_REPOSITORY: &str = "https://github.com/gabchess/kageb.git";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +50,7 @@ pub struct DevnetEvidenceBundleV1 {
 pub struct DevnetEvidenceContentV1 {
     pub cluster: String,
     pub public_commit: String,
+    pub build_toolchain: EvidenceBuildToolchainV1,
     pub checkpoint_artifact_len: usize,
     pub checkpoint_artifact_sha256: String,
     pub deployment: EvidenceDeploymentV1,
@@ -53,6 +61,16 @@ pub struct DevnetEvidenceContentV1 {
     pub token_balances: EvidenceTokenBalancesV1,
     pub decoded_allowlist: Vec<DecodedInstructionEvidenceV1>,
     pub explorer_links: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceBuildToolchainV1 {
+    pub host_rustc: String,
+    pub cargo_build_sbf: String,
+    pub platform_tools: String,
+    pub sbf_rustc: String,
+    pub solana_cli: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +95,8 @@ pub struct EvidenceTransactionV1 {
 #[serde(deny_unknown_fields)]
 pub struct FundingTransactionEvidenceV1 {
     pub authority: String,
+    pub base_source: String,
+    pub quote_source: String,
     pub transaction: EvidenceTransactionV1,
 }
 
@@ -186,6 +206,8 @@ pub enum DevnetEvidenceError {
     RpcUnavailable,
     InvalidTransaction,
     InvalidTokenAccount,
+    InvalidChronology,
+    RepeatedFundingSource,
 }
 
 impl DevnetEvidenceBundleV1 {
@@ -242,6 +264,7 @@ pub struct ExtractedUpgradeableProgramV1 {
 pub struct FinalizedTransactionSnapshotV1 {
     pub signature: String,
     pub slot: u64,
+    pub status_slot: u64,
     pub finalized: bool,
     pub succeeded: bool,
 }
@@ -255,9 +278,15 @@ pub struct DevnetPublicSnapshotV1 {
     pub epoch: PublicAccountSnapshotV1,
     pub base_mint: PublicAccountSnapshotV1,
     pub quote_mint: PublicAccountSnapshotV1,
+    pub current_token_accounts: [PublicAccountSnapshotV1; 4],
     pub transactions: Vec<FinalizedTransactionSnapshotV1>,
     pub token_balances: EvidenceTokenBalancesV1,
     pub decoded_allowlist: Vec<DecodedInstructionEvidenceV1>,
+}
+
+pub(crate) struct CanonicalCheckpointV1 {
+    pub artifact: Vec<u8>,
+    pub build_toolchain: EvidenceBuildToolchainV1,
 }
 
 pub fn extract_upgradeable_program(
@@ -357,6 +386,22 @@ fn validate_public_fields(
     {
         return Err(DevnetEvidenceError::InvalidPublicField);
     }
+    for identity in [
+        &evidence.build_toolchain.host_rustc,
+        &evidence.build_toolchain.cargo_build_sbf,
+        &evidence.build_toolchain.platform_tools,
+        &evidence.build_toolchain.sbf_rustc,
+        &evidence.build_toolchain.solana_cli,
+    ] {
+        if identity.is_empty()
+            || identity.len() > 128
+            || !identity
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        {
+            return Err(DevnetEvidenceError::InvalidPublicField);
+        }
+    }
     if parse_pubkey(&evidence.deployment.program)? != kageb_program::ID
         || parse_pubkey(&evidence.accounts.token_program)? != kageb_program::TOKEN_PROGRAM_ID
     {
@@ -364,6 +409,11 @@ fn validate_public_fields(
     }
     if parse_pubkey(&evidence.deployment.loader)? != UPGRADEABLE_LOADER_ID {
         return Err(DevnetEvidenceError::WrongLoader);
+    }
+    let canonical_programdata =
+        Pubkey::find_program_address(&[kageb_program::ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
+    if parse_pubkey(&evidence.deployment.programdata)? != canonical_programdata {
+        return Err(DevnetEvidenceError::WrongProgramDataAddress);
     }
     let transactions = evidence
         .transactions
@@ -456,9 +506,23 @@ fn validate_transactions(
         if fetched.slot != transaction.slot {
             return Err(DevnetEvidenceError::TransactionSlotMismatch);
         }
+        if fetched.status_slot != transaction.slot {
+            return Err(DevnetEvidenceError::TransactionSlotMismatch);
+        }
     }
     if snapshots.len() != signatures.len() {
         return Err(DevnetEvidenceError::UnexpectedInstruction);
+    }
+    let deployment_slot = evidence.deployment.deployment_slot;
+    let lock_slot = evidence.transactions.lock.slot;
+    let settlement_slot = evidence.transactions.settlement.slot;
+    if deployment_slot >= lock_slot
+        || lock_slot >= settlement_slot
+        || evidence.transactions.funding.iter().any(|funding| {
+            funding.transaction.slot <= deployment_slot || funding.transaction.slot >= lock_slot
+        })
+    {
+        return Err(DevnetEvidenceError::InvalidChronology);
     }
     Ok(())
 }
@@ -467,10 +531,16 @@ fn validate_distinct_funding_authorities(
     evidence: &DevnetEvidenceContentV1,
 ) -> Result<(), DevnetEvidenceError> {
     let mut authorities = BTreeSet::new();
+    let mut sources = BTreeSet::new();
     for funding in &evidence.transactions.funding {
         let authority = parse_pubkey(&funding.authority)?;
         if authority == Pubkey::default() || !authorities.insert(authority) {
             return Err(DevnetEvidenceError::RepeatedFundingAuthority);
+        }
+        for source in [&funding.base_source, &funding.quote_source] {
+            if !sources.insert(parse_pubkey(source)?) {
+                return Err(DevnetEvidenceError::RepeatedFundingSource);
+            }
         }
     }
     Ok(())
@@ -577,6 +647,7 @@ fn validate_token_deltas(
 ) -> Result<(), DevnetEvidenceError> {
     validate_public_mint(&snapshot.base_mint)?;
     validate_public_mint(&snapshot.quote_mint)?;
+    validate_current_token_accounts(evidence, &snapshot.current_token_accounts)?;
     let balances = &evidence.token_balances;
     let base_before = balances
         .pool_base_before
@@ -649,6 +720,44 @@ fn validate_public_mint(mint: &PublicAccountSnapshotV1) -> Result<(), DevnetEvid
     Ok(())
 }
 
+fn validate_current_token_accounts(
+    evidence: &DevnetEvidenceContentV1,
+    accounts: &[PublicAccountSnapshotV1; 4],
+) -> Result<(), DevnetEvidenceError> {
+    let expected = [
+        (
+            &evidence.accounts.base_mint,
+            &evidence.accounts.vault_authority,
+        ),
+        (
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.vault_authority,
+        ),
+        (
+            &evidence.accounts.base_mint,
+            &evidence.accounts.venue_authority,
+        ),
+        (
+            &evidence.accounts.quote_mint,
+            &evidence.accounts.venue_authority,
+        ),
+    ];
+    for (account, (mint, authority)) in accounts.iter().zip(expected) {
+        if account.owner != kageb_program::TOKEN_PROGRAM_ID || account.executable {
+            return Err(DevnetEvidenceError::InvalidTokenAccount);
+        }
+        let token = spl_token_interface::state::Account::unpack(&account.data)
+            .map_err(|_| DevnetEvidenceError::InvalidTokenAccount)?;
+        if token.mint != parse_pubkey(mint)?
+            || token.owner != parse_pubkey(authority)?
+            || token.state != spl_token_interface::state::AccountState::Initialized
+        {
+            return Err(DevnetEvidenceError::InvalidTokenAccount);
+        }
+    }
+    Ok(())
+}
+
 fn validate_allowlist(
     evidence: &DevnetEvidenceContentV1,
     snapshot: &DevnetPublicSnapshotV1,
@@ -708,15 +817,63 @@ fn parse_pubkey(encoded: &str) -> Result<Pubkey, DevnetEvidenceError> {
 }
 
 fn parse_digest(encoded: &str) -> Result<[u8; 32], DevnetEvidenceError> {
-    if encoded.len() != 64 {
+    let encoded = encoded.as_bytes();
+    if encoded.len() != 64 || !encoded.iter().all(u8::is_ascii_hexdigit) {
         return Err(DevnetEvidenceError::InvalidPublicField);
     }
     let mut decoded = [0_u8; 32];
-    for (index, byte) in decoded.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
-            .map_err(|_| DevnetEvidenceError::InvalidPublicField)?;
+    for (pair, byte) in encoded.chunks_exact(2).zip(&mut decoded) {
+        *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, DevnetEvidenceError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(DevnetEvidenceError::InvalidPublicField),
+    }
+}
+
+fn validate_rpc_response_len(actual: usize, expected: usize) -> Result<(), DevnetEvidenceError> {
+    if actual != expected {
+        return Err(DevnetEvidenceError::RpcUnavailable);
+    }
+    Ok(())
+}
+
+fn verify_queried_transaction(
+    transaction: &solana_transaction::versioned::VersionedTransaction,
+    expected: &solana_signature::Signature,
+) -> Result<(), DevnetEvidenceError> {
+    if transaction.signatures.first() != Some(expected) {
+        return Err(DevnetEvidenceError::InvalidTransaction);
+    }
+    transaction
+        .verify_and_hash_message()
+        .map(|_| ())
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)
+}
+
+fn verify_ed25519_instruction(
+    instruction: &Instruction,
+) -> Result<kageb_program::ed25519::StrictEd25519, DevnetEvidenceError> {
+    let parsed = kageb_program::ed25519::parse_strict_ed25519(instruction)
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+    let signature = Signature::from_slice(
+        instruction
+            .data
+            .get(48..112)
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?,
+    )
+    .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+    let key = VerifyingKey::from_bytes(parsed.signer.as_array())
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+    key.verify_strict(&parsed.digest, &signature)
+        .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+    Ok(parsed)
 }
 
 pub fn fetch_devnet_public_snapshot(
@@ -771,12 +928,20 @@ pub fn fetch_devnet_public_snapshot(
         .get_signature_statuses_with_history(&signatures)
         .map_err(|_| DevnetEvidenceError::RpcUnavailable)?
         .value;
+    validate_rpc_response_len(statuses.len(), signatures.len())?;
     let mut transaction_snapshots = Vec::with_capacity(signatures.len());
     let mut fetched_transactions = Vec::with_capacity(signatures.len());
-    for ((expected, signature), status) in
-        expected_transactions.iter().zip(&signatures).zip(statuses)
-    {
-        let status = status.ok_or(DevnetEvidenceError::MissingTransaction)?;
+    for index in 0..signatures.len() {
+        let expected = expected_transactions
+            .get(index)
+            .ok_or(DevnetEvidenceError::RpcUnavailable)?;
+        let signature = signatures
+            .get(index)
+            .ok_or(DevnetEvidenceError::RpcUnavailable)?;
+        let status = statuses
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(DevnetEvidenceError::MissingTransaction)?;
         let finalized =
             status.satisfies_commitment(solana_commitment_config::CommitmentConfig::finalized());
         let succeeded = status.err.is_none() && status.status.is_ok();
@@ -790,9 +955,16 @@ pub fn fetch_devnet_public_snapshot(
                 },
             )
             .map_err(|_| DevnetEvidenceError::MissingTransaction)?;
+        let decoded = fetched
+            .transaction
+            .transaction
+            .decode()
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+        verify_queried_transaction(&decoded, signature)?;
         transaction_snapshots.push(FinalizedTransactionSnapshotV1 {
             signature: expected.signature.clone(),
             slot: fetched.slot,
+            status_slot: status.slot,
             finalized,
             succeeded,
         });
@@ -800,22 +972,30 @@ pub fn fetch_devnet_public_snapshot(
     }
 
     let mut decoded_allowlist = Vec::new();
-    for (index, (funding, transaction)) in evidence
-        .transactions
-        .funding
-        .iter()
-        .zip(&fetched_transactions[..4])
-        .enumerate()
-    {
+    let mut funding_sources = BTreeSet::new();
+    for index in 0..4 {
+        let funding = evidence
+            .transactions
+            .funding
+            .get(index)
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+        let transaction = fetched_transactions
+            .get(index)
+            .ok_or(DevnetEvidenceError::InvalidTransaction)?;
         decoded_allowlist.extend(decode_funding_transaction(
             transaction,
             index,
             funding,
             evidence,
+            &mut funding_sources,
         )?);
     }
-    let lock = &fetched_transactions[4];
-    let settlement = &fetched_transactions[5];
+    let lock = fetched_transactions
+        .get(4)
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
+    let settlement = fetched_transactions
+        .get(5)
+        .ok_or(DevnetEvidenceError::InvalidTransaction)?;
     let observer_accounts = observer_accounts(evidence)?;
     PublicTrace::from_confirmed_kageb(lock, settlement, observer_accounts)
         .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
@@ -826,7 +1006,7 @@ pub fn fetch_devnet_public_snapshot(
         evidence,
     )?);
     let token_balances = transaction_token_balances(settlement, evidence)?;
-    validate_live_token_accounts(&rpc, evidence, &token_balances)?;
+    let current_token_accounts = fetch_live_token_accounts(&rpc, evidence)?;
     Ok(DevnetPublicSnapshotV1 {
         program,
         programdata_address,
@@ -835,6 +1015,7 @@ pub fn fetch_devnet_public_snapshot(
         epoch,
         base_mint,
         quote_mint,
+        current_token_accounts,
         transactions: transaction_snapshots,
         token_balances,
         decoded_allowlist,
@@ -850,36 +1031,196 @@ pub fn verify_devnet_evidence_at_rpc(
     verify_devnet_evidence(bundle, &snapshot, checkpoint_artifact)
 }
 
-pub fn verify_evidence_file(path: &std::path::Path, rpc_url: &str) -> Result<String, String> {
-    const MAX_EVIDENCE_BYTES: u64 = 65_536;
-
-    let size = std::fs::metadata(path)
-        .map_err(|error| format!("read evidence metadata {}: {error}", path.display()))?
-        .len();
-    if size > MAX_EVIDENCE_BYTES {
-        return Err(format!("evidence exceeds {MAX_EVIDENCE_BYTES} bytes"));
+pub(crate) fn build_canonical_checkpoint(commit: &str) -> Result<CanonicalCheckpointV1, String> {
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("checkpoint commit must be 40 ASCII hex characters".to_owned());
     }
-    let json = std::fs::read_to_string(path)
-        .map_err(|error| format!("read evidence {}: {error}", path.display()))?;
+    let temporary =
+        tempfile::tempdir().map_err(|_| "create checkpoint workspace failed".to_owned())?;
+    let checkout = temporary.path().join("checkpoint");
+    command_output(
+        std::process::Command::new("git")
+            .args(["clone", "--quiet", "--no-checkout", CANONICAL_REPOSITORY])
+            .arg(&checkout),
+        "clone canonical checkpoint",
+    )?;
+    command_output(
+        std::process::Command::new("git")
+            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .current_dir(&checkout),
+        "resolve canonical checkpoint",
+    )?;
+    let reachable = command_output(
+        std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("--contains={commit}"),
+                "refs/remotes/origin",
+                "refs/tags",
+            ])
+            .current_dir(&checkout),
+        "check canonical checkpoint reachability",
+    )?;
+    if reachable.trim().is_empty() {
+        return Err("checkpoint commit is not reachable from the canonical repository".to_owned());
+    }
+    command_output(
+        std::process::Command::new("git")
+            .args(["checkout", "--quiet", "--detach", commit])
+            .current_dir(&checkout),
+        "checkout canonical checkpoint",
+    )?;
+    if !command_output(
+        std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&checkout),
+        "inspect canonical checkpoint",
+    )?
+    .trim()
+    .is_empty()
+    {
+        return Err("canonical checkpoint checkout is not clean".to_owned());
+    }
+
+    let cargo = crate::demo::resolve_cargo().map_err(|_| "resolve cargo failed".to_owned())?;
+    let build_versions = command_output(
+        std::process::Command::new(&cargo)
+            .args(["build-sbf", "--version"])
+            .current_dir(&checkout),
+        "read SBF build identity",
+    )?;
+    let mut build_versions = build_versions.lines();
+    let cargo_build_sbf = build_versions
+        .next()
+        .filter(|line| line.starts_with("cargo-build-sbf "))
+        .ok_or("invalid cargo-build-sbf identity")?
+        .to_owned();
+    let platform_tools = build_versions
+        .next()
+        .filter(|line| line.starts_with("platform-tools "))
+        .ok_or("invalid platform-tools identity")?
+        .to_owned();
+    let sbf_rustc = build_versions
+        .next()
+        .filter(|line| line.starts_with("rustc "))
+        .ok_or("invalid SBF rustc identity")?
+        .to_owned();
+    let rustc_next_to_cargo = cargo
+        .parent()
+        .map(|parent| parent.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }))
+        .filter(|candidate| candidate.is_file());
+    let rustc = match rustc_next_to_cargo {
+        Some(rustc) => rustc,
+        None => crate::demo::resolve_on_path("rustc")
+            .map_err(|_| "resolve host rustc failed".to_owned())?,
+    };
+    let host_rustc = command_output(
+        std::process::Command::new(rustc)
+            .arg("--version")
+            .current_dir(&checkout),
+        "read host Rust identity",
+    )?
+    .trim()
+    .to_owned();
+    let solana = crate::demo::resolve_on_path("solana")
+        .map_err(|_| "resolve Solana CLI failed".to_owned())?;
+    let solana_cli = command_output(
+        std::process::Command::new(solana)
+            .arg("--version")
+            .current_dir(&checkout),
+        "read Solana CLI identity",
+    )?
+    .trim()
+    .to_owned();
+    command_output(
+        std::process::Command::new(&cargo)
+            .args(["build-sbf", "--manifest-path"])
+            .arg(checkout.join("crates/kageb-program/Cargo.toml"))
+            .args(["--", "--locked"])
+            .current_dir(&checkout),
+        "build canonical checkpoint",
+    )?;
+    let artifact = std::fs::read(checkout.join("target/deploy/kageb_program.so"))
+        .map_err(|_| "read canonical checkpoint artifact failed".to_owned())?;
+    if !artifact.starts_with(b"\x7fELF") {
+        return Err("canonical checkpoint artifact is not ELF".to_owned());
+    }
+    Ok(CanonicalCheckpointV1 {
+        artifact,
+        build_toolchain: EvidenceBuildToolchainV1 {
+            host_rustc,
+            cargo_build_sbf,
+            platform_tools,
+            sbf_rustc,
+            solana_cli,
+        },
+    })
+}
+
+fn command_output(command: &mut std::process::Command, label: &str) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|_| format!("{label} failed to launch"))?;
+    if !output.status.success() {
+        return Err(format!("{label} failed"));
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("{label} returned non-UTF-8 output"))
+}
+
+pub fn verify_evidence_file(path: &Path, rpc_url: &str) -> Result<String, String> {
+    let json = read_evidence_input(path)?;
     let bundle = DevnetEvidenceBundleV1::from_json(&json)
         .map_err(|error| format!("parse evidence: {error:?}"))?;
     bundle
         .verify_content_hash()
         .map_err(|error| format!("verify evidence content address: {error:?}"))?;
-    let artifact = std::env::var_os("KAGEB_CHECKPOINT_ARTIFACT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/deploy/kageb_program.so")
-        });
-    let bytes = std::fs::read(&artifact)
-        .map_err(|error| format!("read checkpoint artifact {}: {error}", artifact.display()))?;
-    verify_devnet_evidence_at_rpc(&bundle, &bytes, rpc_url)
+    let checkpoint = build_canonical_checkpoint(&bundle.content.public_commit)?;
+    if checkpoint.build_toolchain != bundle.content.build_toolchain {
+        return Err("canonical checkpoint build toolchain differs from evidence".to_owned());
+    }
+    verify_devnet_evidence_at_rpc(&bundle, &checkpoint.artifact, rpc_url)
         .map_err(|error| format!("verify finalized devnet evidence: {error:?}"))?;
     Ok(format!(
-        "VERIFIED: finalized devnet aggregate settlement {}\n",
-        bundle.content.transactions.settlement.signature
+        "VERIFIED: evidence {} settlement {}\n",
+        bundle.evidence_sha256, bundle.content.transactions.settlement.signature
     ))
+}
+
+fn read_evidence_input(path: &Path) -> Result<String, String> {
+    const MAX_EVIDENCE_BYTES: usize = 65_536;
+
+    let mut bytes = Vec::with_capacity(MAX_EVIDENCE_BYTES.min(8 * 1024));
+    if path == Path::new("-") {
+        std::io::stdin()
+            .lock()
+            .take((MAX_EVIDENCE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "read evidence stdin failed".to_owned())?;
+    } else {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options
+            .open(path)
+            .map_err(|_| "regular evidence file required".to_owned())?;
+        if !file
+            .metadata()
+            .map_err(|_| "read evidence metadata failed".to_owned())?
+            .file_type()
+            .is_file()
+        {
+            return Err("regular evidence file required".to_owned());
+        }
+        file.take((MAX_EVIDENCE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "read evidence failed".to_owned())?;
+    }
+    if bytes.len() > MAX_EVIDENCE_BYTES {
+        return Err(format!("evidence exceeds {MAX_EVIDENCE_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "evidence is not UTF-8".to_owned())
 }
 
 fn fetch_finalized_account(
@@ -927,6 +1268,7 @@ fn decode_funding_transaction(
     funding_index: usize,
     funding: &FundingTransactionEvidenceV1,
     evidence: &DevnetEvidenceContentV1,
+    global_sources: &mut BTreeSet<Pubkey>,
 ) -> Result<Vec<DecodedInstructionEvidenceV1>, DevnetEvidenceError> {
     let meta = confirmed
         .transaction
@@ -950,6 +1292,8 @@ fn decode_funding_transaction(
         .ok_or(DevnetEvidenceError::InvalidTransaction)?;
     let keys = transaction.message.static_account_keys();
     let instructions = transaction.message.instructions();
+    let pre = token_balance_list(&meta.pre_token_balances)?;
+    let post = token_balance_list(&meta.post_token_balances)?;
     let authority = parse_pubkey(&funding.authority)?;
     if keys.first() != Some(&parse_pubkey(&evidence.accounts.fee_payer)?)
         || instructions.len() != 2
@@ -967,18 +1311,19 @@ fn decode_funding_transaction(
             parse_pubkey(&evidence.accounts.base_mint)?,
             parse_pubkey(&evidence.accounts.pool_base_vault)?,
             evidence.configuration.base_lot_atoms,
+            parse_pubkey(&funding.base_source)?,
             "pool-funding-base",
         ),
         (
             parse_pubkey(&evidence.accounts.quote_mint)?,
             parse_pubkey(&evidence.accounts.pool_quote_vault)?,
             evidence.configuration.quote_atoms_per_lot,
+            parse_pubkey(&funding.quote_source)?,
             "pool-funding-quote",
         ),
     ];
     let mut decoded = Vec::with_capacity(2);
-    let mut sources = BTreeSet::new();
-    for (position, (instruction, (mint, destination, amount, kind))) in
+    for (position, (instruction, (mint, destination, amount, source, kind))) in
         instructions.iter().zip(expected).enumerate()
     {
         if keys.get(instruction.program_id_index as usize) != Some(&kageb_program::TOKEN_PROGRAM_ID)
@@ -1000,8 +1345,9 @@ fn decode_funding_transaction(
         if accounts[1] != mint
             || accounts[2] != destination
             || accounts[3] != authority
+            || accounts[0] != source
             || accounts[0] == destination
-            || !sources.insert(accounts[0])
+            || !global_sources.insert(accounts[0])
             || !matches!(
                 token,
                 spl_token_interface::instruction::TokenInstruction::TransferChecked {
@@ -1009,6 +1355,40 @@ fn decode_funding_transaction(
                     decimals: 0,
                 } if actual == amount
             )
+        {
+            return Err(DevnetEvidenceError::InvalidTransaction);
+        }
+        let source_pre = token_balance_at(
+            pre,
+            keys,
+            &source.to_string(),
+            &mint.to_string(),
+            &authority.to_string(),
+        )?;
+        let source_post = token_balance_at(
+            post,
+            keys,
+            &source.to_string(),
+            &mint.to_string(),
+            &authority.to_string(),
+        )?;
+        let destination_owner = parse_pubkey(&evidence.accounts.vault_authority)?;
+        let destination_pre = token_balance_at(
+            pre,
+            keys,
+            &destination.to_string(),
+            &mint.to_string(),
+            &destination_owner.to_string(),
+        )?;
+        let destination_post = token_balance_at(
+            post,
+            keys,
+            &destination.to_string(),
+            &mint.to_string(),
+            &destination_owner.to_string(),
+        )?;
+        if source_pre.checked_sub(amount) != Some(source_post)
+            || destination_pre.checked_add(amount) != Some(destination_post)
         {
             return Err(DevnetEvidenceError::InvalidTransaction);
         }
@@ -1045,12 +1425,11 @@ fn decode_kageb_transaction(
             .copied()
             .ok_or(DevnetEvidenceError::InvalidTransaction)?;
         let (kind, digest) = if program == solana_program::ed25519_program::ID {
-            let parsed = kageb_program::ed25519::parse_strict_ed25519(&Instruction {
+            let parsed = verify_ed25519_instruction(&Instruction {
                 program_id: program,
                 accounts: Vec::new(),
                 data: instruction.data.clone(),
-            })
-            .map_err(|_| DevnetEvidenceError::InvalidTransaction)?;
+            })?;
             if !actual_signers.insert(parsed.signer) {
                 return Err(DevnetEvidenceError::WrongKeyper);
             }
@@ -1291,52 +1670,22 @@ fn token_balance_at(
         .map_err(|_| DevnetEvidenceError::InvalidTransaction)
 }
 
-fn validate_live_token_accounts(
+fn fetch_live_token_accounts(
     rpc: &RpcClient,
     evidence: &DevnetEvidenceContentV1,
-    balances: &EvidenceTokenBalancesV1,
-) -> Result<(), DevnetEvidenceError> {
+) -> Result<[PublicAccountSnapshotV1; 4], DevnetEvidenceError> {
     let accounts = [
-        (
-            &evidence.accounts.pool_base_vault,
-            &evidence.accounts.base_mint,
-            &evidence.accounts.vault_authority,
-            balances.pool_base_after,
-        ),
-        (
-            &evidence.accounts.pool_quote_vault,
-            &evidence.accounts.quote_mint,
-            &evidence.accounts.vault_authority,
-            balances.pool_quote_after,
-        ),
-        (
-            &evidence.accounts.venue_base_account,
-            &evidence.accounts.base_mint,
-            &evidence.accounts.venue_authority,
-            balances.venue_base_after,
-        ),
-        (
-            &evidence.accounts.venue_quote_account,
-            &evidence.accounts.quote_mint,
-            &evidence.accounts.venue_authority,
-            balances.venue_quote_after,
-        ),
+        &evidence.accounts.pool_base_vault,
+        &evidence.accounts.pool_quote_vault,
+        &evidence.accounts.venue_base_account,
+        &evidence.accounts.venue_quote_account,
     ];
-    for (address, mint, authority, amount) in accounts {
-        let account = fetch_finalized_account(rpc, parse_pubkey(address)?)?;
-        if account.owner != kageb_program::TOKEN_PROGRAM_ID {
-            return Err(DevnetEvidenceError::InvalidTokenAccount);
-        }
-        let token = spl_token_interface::state::Account::unpack(&account.data)
-            .map_err(|_| DevnetEvidenceError::InvalidTokenAccount)?;
-        if token.mint != parse_pubkey(mint)?
-            || token.owner != parse_pubkey(authority)?
-            || token.amount != amount
-        {
-            return Err(DevnetEvidenceError::InvalidTokenAccount);
-        }
-    }
-    Ok(())
+    accounts
+        .map(|address| fetch_finalized_account(rpc, parse_pubkey(address)?))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| DevnetEvidenceError::RpcUnavailable)
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -1985,9 +2334,12 @@ const fn residual_wire(residual: Residual) -> (u8, u32) {
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use kageb_program::wire::EpochConfigurationV1;
+    use solana_keypair::Keypair;
     use solana_program::pubkey::Pubkey;
+    use solana_signer::Signer as _;
+    use solana_transaction::Transaction;
 
     use super::*;
     use crate::{EpochDealer, SignedBalanceSnapshotV1};
@@ -2033,5 +2385,62 @@ mod tests {
             SettlementRequestV1::decode_wire(&bytes),
             Err(SettlementValidationError::MemberLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn public_verifier_checks_ed25519_instruction_signature_bytes() {
+        let key = SigningKey::from_bytes(&[41; 32]);
+        let digest = [42; 32];
+        let signature = key.sign(&digest);
+        let instruction = solana_ed25519_program::new_ed25519_instruction_with_signature(
+            &digest,
+            &signature.to_bytes(),
+            &key.verifying_key().to_bytes(),
+        );
+        verify_ed25519_instruction(&instruction).unwrap();
+
+        let mut tampered = instruction;
+        tampered.data[48] ^= 1;
+        assert_eq!(
+            verify_ed25519_instruction(&tampered),
+            Err(DevnetEvidenceError::InvalidTransaction)
+        );
+    }
+
+    #[test]
+    fn public_verifier_checks_queried_transaction_identity_and_signatures() {
+        let payer = Keypair::new();
+        let transaction = Transaction::new_signed_with_payer(
+            &[],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Default::default(),
+        );
+        let expected = transaction.signatures[0];
+        let mut versioned = solana_transaction::versioned::VersionedTransaction::from(transaction);
+        verify_queried_transaction(&versioned, &expected).unwrap();
+
+        assert_eq!(
+            verify_queried_transaction(&versioned, &solana_signature::Signature::from([9_u8; 64]),),
+            Err(DevnetEvidenceError::InvalidTransaction)
+        );
+        versioned.signatures[0] = solana_signature::Signature::from([8_u8; 64]);
+        assert_eq!(
+            verify_queried_transaction(&versioned, &expected),
+            Err(DevnetEvidenceError::InvalidTransaction)
+        );
+    }
+
+    #[test]
+    fn rpc_response_lengths_are_exact() {
+        assert!(validate_rpc_response_len(6, 6).is_ok());
+        assert_eq!(
+            validate_rpc_response_len(5, 6),
+            Err(DevnetEvidenceError::RpcUnavailable)
+        );
+        assert_eq!(
+            validate_rpc_response_len(7, 6),
+            Err(DevnetEvidenceError::RpcUnavailable)
+        );
     }
 }

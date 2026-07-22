@@ -1,13 +1,13 @@
 use kageb::{
     extract_upgradeable_program, verify_devnet_evidence, DecodedInstructionEvidenceV1,
     DevnetEvidenceBundleV1, DevnetEvidenceContentV1, DevnetEvidenceError, DevnetPublicSnapshotV1,
-    EvidenceAccountsV1, EvidenceCommitmentsV1, EvidenceConfigurationV1, EvidenceDeploymentV1,
-    EvidenceTokenBalancesV1, EvidenceTransactionV1, EvidenceTransactionsV1,
+    EvidenceAccountsV1, EvidenceBuildToolchainV1, EvidenceCommitmentsV1, EvidenceConfigurationV1,
+    EvidenceDeploymentV1, EvidenceTokenBalancesV1, EvidenceTransactionV1, EvidenceTransactionsV1,
     FinalizedTransactionSnapshotV1, FundingTransactionEvidenceV1, PublicAccountSnapshotV1,
     UPGRADEABLE_LOADER_ID,
 };
 use kageb_program::state::{EpochStateV1, EpochTerminalState, PoolStateV1};
-use solana_program::{program_pack::Pack, pubkey::Pubkey};
+use solana_program::{program_option::COption, program_pack::Pack, pubkey::Pubkey};
 use std::str::FromStr;
 
 fn key(value: u8) -> String {
@@ -32,11 +32,20 @@ fn transaction(value: u8, slot: u64) -> EvidenceTransactionV1 {
 fn content() -> DevnetEvidenceContentV1 {
     let funding = std::array::from_fn(|index| FundingTransactionEvidenceV1 {
         authority: key(index as u8 + 20),
+        base_source: key(index as u8 + 50),
+        quote_source: key(index as u8 + 60),
         transaction: transaction(index as u8 + 30, 90 + index as u64),
     });
     DevnetEvidenceContentV1 {
         cluster: "devnet".to_owned(),
         public_commit: "1".repeat(40),
+        build_toolchain: EvidenceBuildToolchainV1 {
+            host_rustc: "rustc 1.95.0".to_owned(),
+            cargo_build_sbf: "cargo-build-sbf 4.0.0".to_owned(),
+            platform_tools: "platform-tools v1.53".to_owned(),
+            sbf_rustc: "rustc 1.89.0".to_owned(),
+            solana_cli: "solana-cli 4.0.1".to_owned(),
+        },
         checkpoint_artifact_len: 187_872,
         checkpoint_artifact_sha256: digest(1),
         deployment: EvidenceDeploymentV1 {
@@ -202,6 +211,26 @@ fn mint_account(
     };
     let mut data = vec![0; spl_token_interface::state::Mint::LEN];
     spl_token_interface::state::Mint::pack(mint, &mut data).unwrap();
+    PublicAccountSnapshotV1 {
+        owner: kageb_program::TOKEN_PROGRAM_ID,
+        executable: false,
+        data,
+    }
+}
+
+fn token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> PublicAccountSnapshotV1 {
+    let token = spl_token_interface::state::Account {
+        mint,
+        owner,
+        amount,
+        delegate: COption::None,
+        state: spl_token_interface::state::AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
+    };
+    let mut data = vec![0; spl_token_interface::state::Account::LEN];
+    spl_token_interface::state::Account::pack(token, &mut data).unwrap();
     PublicAccountSnapshotV1 {
         owner: kageb_program::TOKEN_PROGRAM_ID,
         executable: false,
@@ -430,11 +459,14 @@ fn verifier_fixture() -> (DevnetEvidenceBundleV1, DevnetPublicSnapshotV1, Vec<u8
         .map(|transaction| FinalizedTransactionSnapshotV1 {
             signature: transaction.signature,
             slot: transaction.slot,
+            status_slot: transaction.slot,
             finalized: true,
             succeeded: true,
         })
         .collect();
-    let programdata = pubkey(&content.deployment.programdata);
+    let programdata =
+        Pubkey::find_program_address(&[kageb_program::ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
+    content.deployment.programdata = programdata.to_string();
     let snapshot = DevnetPublicSnapshotV1 {
         program: program_account(programdata),
         programdata_address: programdata,
@@ -456,6 +488,28 @@ fn verifier_fixture() -> (DevnetEvidenceBundleV1, DevnetPublicSnapshotV1, Vec<u8
         },
         base_mint: mint_account(None, None),
         quote_mint: mint_account(None, None),
+        current_token_accounts: [
+            token_account(
+                base_mint,
+                vault_authority,
+                content.token_balances.pool_base_after,
+            ),
+            token_account(
+                quote_mint,
+                vault_authority,
+                content.token_balances.pool_quote_after,
+            ),
+            token_account(
+                base_mint,
+                pubkey(&content.accounts.venue_authority),
+                content.token_balances.venue_base_after,
+            ),
+            token_account(
+                quote_mint,
+                pubkey(&content.accounts.venue_authority),
+                content.token_balances.venue_quote_after,
+            ),
+        ],
         transactions: transaction_snapshots,
         token_balances: content.token_balances.clone(),
         decoded_allowlist: content.decoded_allowlist.clone(),
@@ -501,6 +555,32 @@ fn injected_verifier_fails_closed_at_each_public_trust_boundary() {
         Err(DevnetEvidenceError::DeploymentMismatch)
     );
 
+    let mut content = bundle.content.clone();
+    content.deployment.programdata = Pubkey::new_unique().to_string();
+    let mut changed_snapshot = snapshot.clone();
+    changed_snapshot.programdata_address = pubkey(&content.deployment.programdata);
+    changed_snapshot.program = program_account(changed_snapshot.programdata_address);
+    let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
+    assert_eq!(
+        verify_devnet_evidence(&changed, &changed_snapshot, &artifact),
+        Err(DevnetEvidenceError::WrongProgramDataAddress)
+    );
+
+    let mut content = bundle.content.clone();
+    content.deployment.deployment_slot = content.transactions.settlement.slot + 1;
+    let mut changed_snapshot = snapshot.clone();
+    changed_snapshot.programdata = programdata_account(
+        content.deployment.deployment_slot,
+        content.deployment.upgrade_authority.as_deref().map(pubkey),
+        &artifact,
+        &[0; 32],
+    );
+    let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
+    assert_eq!(
+        verify_devnet_evidence(&changed, &changed_snapshot, &artifact),
+        Err(DevnetEvidenceError::InvalidChronology)
+    );
+
     let mut changed = snapshot.clone();
     changed.transactions.pop();
     assert_eq!(
@@ -529,12 +609,39 @@ fn injected_verifier_fails_closed_at_each_public_trust_boundary() {
         Err(DevnetEvidenceError::TransactionSlotMismatch)
     );
 
+    let mut changed = snapshot.clone();
+    changed.transactions[0].status_slot += 1;
+    assert_eq!(
+        verify_devnet_evidence(&bundle, &changed, &artifact),
+        Err(DevnetEvidenceError::TransactionSlotMismatch)
+    );
+
+    let mut content = bundle.content.clone();
+    content.transactions.funding[0].transaction.slot = content.transactions.lock.slot;
+    let mut changed_snapshot = snapshot.clone();
+    changed_snapshot.transactions[0].slot = content.transactions.lock.slot;
+    changed_snapshot.transactions[0].status_slot = content.transactions.lock.slot;
+    let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
+    assert_eq!(
+        verify_devnet_evidence(&changed, &changed_snapshot, &artifact),
+        Err(DevnetEvidenceError::InvalidChronology)
+    );
+
     let mut content = bundle.content.clone();
     content.transactions.funding[1].authority = content.transactions.funding[0].authority.clone();
     let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
     assert_eq!(
         verify_devnet_evidence(&changed, &snapshot, &artifact),
         Err(DevnetEvidenceError::RepeatedFundingAuthority)
+    );
+
+    let mut content = bundle.content.clone();
+    content.transactions.funding[1].base_source =
+        content.transactions.funding[0].base_source.clone();
+    let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
+    assert_eq!(
+        verify_devnet_evidence(&changed, &snapshot, &artifact),
+        Err(DevnetEvidenceError::RepeatedFundingSource)
     );
 
     let mut content = bundle.content.clone();
@@ -612,6 +719,12 @@ fn injected_verifier_fails_closed_at_each_public_trust_boundary() {
         verify_devnet_evidence(&bundle, &changed, &artifact),
         Err(DevnetEvidenceError::InvalidTokenAccount)
     );
+
+    let mut changed = snapshot.clone();
+    let base_mint = pubkey(&bundle.content.accounts.base_mint);
+    let vault_authority = pubkey(&bundle.content.accounts.vault_authority);
+    changed.current_token_accounts[0] = token_account(base_mint, vault_authority, 999);
+    verify_devnet_evidence(&bundle, &changed, &artifact).unwrap();
 }
 
 #[test]
@@ -627,4 +740,19 @@ fn verifier_rejects_overflowing_public_token_totals_without_panicking() {
         verify_devnet_evidence(&changed, &snapshot, &artifact),
         Err(DevnetEvidenceError::WrongTokenDelta)
     );
+}
+
+#[test]
+fn verifier_rejects_unicode_hex_without_panicking() {
+    let (bundle, snapshot, artifact) = verifier_fixture();
+    let mut content = bundle.content;
+    content.commitments.result = "é".repeat(32);
+    let changed = DevnetEvidenceBundleV1::seal(content).unwrap();
+
+    let result =
+        std::panic::catch_unwind(|| verify_devnet_evidence(&changed, &snapshot, &artifact));
+    assert!(matches!(
+        result,
+        Ok(Err(DevnetEvidenceError::InvalidPublicField))
+    ));
 }

@@ -2924,6 +2924,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.1.16",
  "kageb-program",
+ "libc",
  "rand 0.7.3",
  "rand_chacha 0.2.2",
  "serde",

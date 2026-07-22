@@ -12,6 +12,8 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use base64::Engine as _;
+use bincode::Options as _;
 use ed25519_dalek::SigningKey;
 use kageb_program::{
     epoch_address,
@@ -28,6 +30,7 @@ use sha2::{Digest, Sha256};
 use solana_commitment_config::CommitmentConfig;
 use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_keypair::{read_keypair_file, Keypair};
+use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_program::{clock::Clock, instruction::Instruction, program_pack::Pack, pubkey::Pubkey};
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signature::Signature;
@@ -37,7 +40,9 @@ use solana_transaction_status_client_types::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
 };
 use tempfile::TempDir;
+use threshold_crypto::serde_impl::SerdeSecret;
 
+use crate::evidence::{build_canonical_checkpoint, CanonicalCheckpointV1};
 use crate::{
     admit_batch, content_root, extract_upgradeable_program, net_batch, run_keyper_release_share,
     run_keyper_sign_lock, run_keyper_sign_settlement, AdmissionPolicyV1, BalanceRecordV1,
@@ -53,6 +58,136 @@ use crate::{
 };
 
 const NON_CLAIM: &str = "It does not prove unique humans, production anonymity, private funding or withdrawal, a trustless exchange, protection from the KageB operator, or safe use with real funds.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DevnetDeploymentAction {
+    Noop,
+    Initial,
+    Upgrade,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DevnetPeakRents {
+    setup: u64,
+    program: u64,
+    programdata: u64,
+    buffer: u64,
+    fees: u64,
+}
+
+fn select_deployment_action(
+    deployed: Option<&crate::ExtractedUpgradeableProgramV1>,
+    artifact: &[u8],
+    payer: Pubkey,
+    initial_program_key: Option<Pubkey>,
+) -> Result<DevnetDeploymentAction, String> {
+    let Some(deployed) = deployed else {
+        if initial_program_key != Some(ID) {
+            return Err("initial deployment requires the fixed external program key".to_owned());
+        }
+        return Ok(DevnetDeploymentAction::Initial);
+    };
+    if deployed.executable == artifact {
+        return Ok(DevnetDeploymentAction::Noop);
+    }
+    if deployed.upgrade_authority != Some(payer) {
+        return Err("deployed checkpoint differs and payer is not upgrade authority".to_owned());
+    }
+    Ok(DevnetDeploymentAction::Upgrade)
+}
+
+fn required_peak_balance(
+    action: DevnetDeploymentAction,
+    rents: DevnetPeakRents,
+) -> Result<u64, String> {
+    let mut required = rents
+        .setup
+        .checked_add(rents.fees)
+        .ok_or("devnet peak balance overflow")?;
+    if action != DevnetDeploymentAction::Noop {
+        required = required
+            .checked_add(rents.program)
+            .and_then(|value| value.checked_add(rents.programdata))
+            .and_then(|value| value.checked_add(rents.buffer))
+            .ok_or("devnet peak balance overflow")?;
+    }
+    Ok(required)
+}
+
+fn checked_devnet_deadlines(now: i64, current_slot: u64) -> Result<(i64, i64, u64), String> {
+    Ok((
+        now.checked_add(300).ok_or("lock deadline overflow")?,
+        now.checked_add(900).ok_or("abort deadline overflow")?,
+        current_slot
+            .checked_add(2_000)
+            .ok_or("authorization slot overflow")?,
+    ))
+}
+
+fn publish_bytes_noclobber(out: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|_| "create evidence directory failed".to_owned())?;
+    let mut pending = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|_| "create pending evidence failed".to_owned())?;
+    pending
+        .write_all(bytes)
+        .and_then(|()| pending.as_file().sync_all())
+        .map_err(|_| "write pending evidence failed".to_owned())?;
+    let persisted = pending
+        .persist_noclobber(out)
+        .map_err(|_| "evidence output already exists".to_owned())?;
+    persisted
+        .sync_all()
+        .map_err(|_| "sync evidence failed".to_owned())?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "sync evidence directory failed".to_owned())
+}
+
+fn scan_public_evidence_bytes(bytes: &[u8], secret_encodings: &[Vec<u8>]) -> Result<(), String> {
+    const FORBIDDEN: [&[u8]; 7] = [
+        b"plaintext",
+        b"signed_intent",
+        b"ciphertext",
+        b"decryption",
+        b"reservation",
+        b".kageb-private",
+        b"keyper-attestation-key",
+    ];
+    let contains = |needle: &[u8]| {
+        !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+    };
+    if FORBIDDEN.into_iter().any(contains) || secret_encodings.iter().any(|secret| contains(secret))
+    {
+        return Err("public evidence contains private material".to_owned());
+    }
+    Ok(())
+}
+
+fn private_material_encodings(material: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut encodings = Vec::with_capacity(material.len() * 7);
+    for secret in material.iter().filter(|secret| !secret.is_empty()) {
+        let hex = hex_bytes(secret);
+        encodings.push(secret.clone());
+        encodings.push(hex.as_bytes().to_vec());
+        encodings.push(hex.to_ascii_uppercase().into_bytes());
+        encodings.push(bs58::encode(secret).into_string().into_bytes());
+        encodings.push(
+            base64::engine::general_purpose::STANDARD
+                .encode(secret)
+                .into_bytes(),
+        );
+        encodings.push(
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(secret)
+                .into_bytes(),
+        );
+        if let Ok(json) = serde_json::to_vec(secret) {
+            encodings.push(json);
+        }
+    }
+    encodings
+}
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     let mut bytes = [0_u8; N];
@@ -109,7 +244,8 @@ pub fn trace_fixture() -> Result<String, LedgerError> {
 }
 
 pub fn local_proof() -> Result<String, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable =
+        std::env::current_exe().map_err(|_| "locate KageB executable failed".to_owned())?;
     let cargo = resolve_cargo()?;
     let validator_executable = resolve_on_path("solana-test-validator")?;
     let (artifact, token_artifact) = fresh_sbf_artifacts(&cargo)?;
@@ -144,7 +280,6 @@ pub fn local_proof() -> Result<String, String> {
         Keypair::new(),
         Keypair::new(),
     ];
-
     let base_mint = create_mint(&rpc, &payer).map_err(|error| {
         format!(
             "{error}\nvalidator diagnostics:\n{}",
@@ -687,9 +822,11 @@ pub fn devnet_proof(
         return Err(format!("fixed program ID required: {ID}"));
     }
     if out.exists() {
-        return Err(format!("refusing to overwrite evidence {}", out.display()));
+        return Err("refusing to overwrite existing evidence".to_owned());
     }
-    let (public_commit, artifact) = clean_public_checkpoint_artifact()?;
+    let (public_commit, checkpoint) = clean_public_checkpoint_artifact()?;
+    let artifact = checkpoint.artifact;
+    let build_toolchain = checkpoint.build_toolchain;
     let checkpoint_artifact_sha256 = hex_sha256(&artifact);
     let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
     if rpc
@@ -702,34 +839,45 @@ pub fn devnet_proof(
     }
     let programdata_address =
         Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
-    let program_account = rpc
-        .get_account(&ID)
-        .map_err(|_| format!("fixed program {ID} is not deployed on devnet"))?;
-    let programdata_account = rpc
-        .get_account(&programdata_address)
-        .map_err(|error| format!("read ProgramData {programdata_address}: {error}"))?;
-    let deployed = extract_upgradeable_program(
-        &PublicAccountSnapshotV1 {
-            owner: program_account.owner,
-            executable: program_account.executable,
-            data: program_account.data,
-        },
-        programdata_address,
-        &PublicAccountSnapshotV1 {
-            owner: programdata_account.owner,
-            executable: programdata_account.executable,
-            data: programdata_account.data,
-        },
-        artifact.len(),
-    )
-    .map_err(|error| format!("extract deployed checkpoint: {error:?}"))?;
+    let deployed_before = fetch_deployed_checkpoint(&rpc, artifact.len())?;
+    let payer = read_keypair_file(payer_path).map_err(|_| "read devnet payer failed".to_owned())?;
+    let initial_program_key = if deployed_before.is_none() {
+        Some(resolve_external_program_keypair()?)
+    } else {
+        None
+    };
+    let deployment_action = select_deployment_action(
+        deployed_before.as_ref(),
+        &artifact,
+        payer.pubkey(),
+        initial_program_key.as_ref().map(Signer::pubkey),
+    )?;
+    require_devnet_peak_balance(&rpc, &payer, deployment_action, artifact.len())?;
+    let executable =
+        std::env::current_exe().map_err(|_| "locate KageB executable failed".to_owned())?;
+    let private_root = private_runtime_root()?;
+    let run_directory =
+        tempfile::tempdir_in(&private_root).map_err(|_| "create private run failed".to_owned())?;
+    if deployment_action != DevnetDeploymentAction::Noop {
+        deploy_checkpoint(
+            rpc_url,
+            &payer,
+            initial_program_key.as_ref(),
+            deployment_action,
+            run_directory.path(),
+            &artifact,
+        )?;
+    }
+    let deployed = fetch_deployed_checkpoint(&rpc, artifact.len())?
+        .ok_or("fixed program deployment is missing after deploy")?;
     if deployed.executable != artifact {
         return Err("deployed executable does not match the public checkpoint".to_owned());
     }
-    let payer = read_keypair_file(payer_path).map_err(|_| "read devnet payer failed".to_owned())?;
-    require_devnet_setup_balance(&rpc, &payer)?;
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let private_root = private_runtime_root()?;
+    if deployment_action != DevnetDeploymentAction::Noop
+        && deployed.upgrade_authority != Some(payer.pubkey())
+    {
+        return Err("payer is not recorded as provisional upgrade authority".to_owned());
+    }
 
     let operator_seed = random_bytes()?;
     let operator = Keypair::new_from_array(operator_seed);
@@ -746,6 +894,24 @@ pub fn devnet_proof(
         Keypair::new(),
         Keypair::new(),
     ];
+    let mut private_material = vec![
+        payer.to_bytes().to_vec(),
+        operator_seed.to_vec(),
+        venue_authority.to_bytes().to_vec(),
+        payer_path.as_os_str().as_encoded_bytes().to_vec(),
+        private_root.as_os_str().as_encoded_bytes().to_vec(),
+        run_directory.path().as_os_str().as_encoded_bytes().to_vec(),
+        executable.as_os_str().as_encoded_bytes().to_vec(),
+    ];
+    if let Some(keypair) = &initial_program_key {
+        private_material.push(keypair.to_bytes().to_vec());
+    }
+    private_material.extend(attesters.iter().map(|key| key.to_bytes().to_vec()));
+    private_material.extend(
+        participant_wallets
+            .iter()
+            .map(|wallet| wallet.to_bytes().to_vec()),
+    );
     let base_mint = create_mint(&rpc, &payer)?;
     let quote_mint = create_mint(&rpc, &payer)?;
     let (pool, _) = pool_address(
@@ -768,11 +934,13 @@ pub fn devnet_proof(
     )?;
     mint_to(&rpc, &payer, &base_mint.pubkey(), &venue_base_account, 10)?;
     let mut funding_signatures = Vec::with_capacity(4);
+    let mut funding_sources = Vec::with_capacity(4);
     for wallet in &participant_wallets {
         let base = create_token_account(&rpc, &payer, &base_mint.pubkey(), &wallet.pubkey())?;
         let quote = create_token_account(&rpc, &payer, &quote_mint.pubkey(), &wallet.pubkey())?;
         mint_to(&rpc, &payer, &base_mint.pubkey(), &base, 1)?;
         mint_to(&rpc, &payer, &quote_mint.pubkey(), &quote, 100)?;
+        funding_sources.push((base, quote));
         funding_signatures.push(fund_pool_accounts(
             &rpc,
             &payer,
@@ -841,8 +1009,9 @@ pub fn devnet_proof(
         bincode::deserialize(&clock_account.data).map_err(|error| error.to_string())?;
     let epoch_id = random_bytes()?;
     let (epoch, _) = epoch_address(&pool, &epoch_id);
-    let lock_deadline = clock.unix_timestamp + 300;
-    let abort_deadline = clock.unix_timestamp + 900;
+    let current_slot = rpc.get_slot().map_err(|error| error.to_string())?;
+    let (lock_deadline, abort_deadline, authorization_expiry_slot) =
+        checked_devnet_deadlines(clock.unix_timestamp, current_slot)?;
     send(
         &rpc,
         &payer,
@@ -862,21 +1031,29 @@ pub fn devnet_proof(
         &[&operator],
     )?;
 
-    let run_directory = tempfile::tempdir_in(&private_root).map_err(|error| error.to_string())?;
     let mut reservations = ReservationJournal::open(run_directory.path().join("reservations.bin"))
         .map_err(|error| format!("reservation journal: {error:?}"))?;
     let suspensions = SuspensionRegistry::open(run_directory.path().join("suspensions.bin"))
         .map_err(|error| format!("suspension registry: {error:?}"))?;
     let sides = [Side::Buy, Side::Sell, Side::Buy, Side::Buy];
-    let current_slot = rpc.get_slot().map_err(|error| error.to_string())?;
     let mut submissions = Vec::with_capacity(4);
     let mut participant_ids = Vec::with_capacity(4);
     for side in sides {
         let trading = random_signing_key()?;
         let participant_id = random_bytes()?;
+        let reservation_id = random_bytes()?;
+        let intent_nonce = random_bytes()?;
+        let receipt = random_bytes()?;
+        private_material.extend([
+            trading.to_bytes().to_vec(),
+            participant_id.to_vec(),
+            reservation_id.to_vec(),
+            intent_nonce.to_vec(),
+            receipt.to_vec(),
+        ]);
         let reserved = reservations
             .reserve(
-                ReservationRecord::new(random_bytes()?, participant_id, 1, 100)
+                ReservationRecord::new(reservation_id, participant_id, 1, 100)
                     .map_err(|error| format!("reservation: {error:?}"))?,
                 PoolBalance::new(1, 100),
             )
@@ -887,10 +1064,10 @@ pub fn devnet_proof(
                 epoch_id,
                 trading.verifying_key(),
                 &operator_attestation,
-                current_slot + 2_000,
+                authorization_expiry_slot,
             )
             .map_err(|error| format!("authorization: {error:?}"))?;
-        let body = IntentBodyV1::new(side, 1, 100, epoch_id, participant_id, random_bytes()?)
+        let body = IntentBodyV1::new(side, 1, 100, epoch_id, participant_id, intent_nonce)
             .map_err(|error| error.to_string())?;
         let signed = SignedIntentV1::sign(body, &trading);
         let encrypted = dealer
@@ -898,7 +1075,7 @@ pub fn devnet_proof(
             .encrypt(&signed)
             .map_err(|error| format!("encrypt: {error:?}"))?;
         submissions.push(
-            EncryptedSubmissionV1::sign(authorization, encrypted, random_bytes()?, &trading)
+            EncryptedSubmissionV1::sign(authorization, encrypted, receipt, &trading)
                 .map_err(|error| format!("submission: {error:?}"))?,
         );
         participant_ids.push(participant_id);
@@ -910,6 +1087,8 @@ pub fn devnet_proof(
         .map_err(|error| format!("balance: {error:?}"))?;
     let snapshot = SignedBalanceSnapshotV1::sign(epoch_id, &balances, &operator_attestation)
         .map_err(|error| format!("snapshot: {error:?}"))?;
+    let package_nonce = random_bytes()?;
+    private_material.push(package_nonce.to_vec());
     let package = LockPackageV1::new(
         epoch,
         kageb_program::wire::EpochConfigurationV1 {
@@ -932,7 +1111,7 @@ pub fn devnet_proof(
         submissions,
         balances,
         snapshot,
-        random_bytes()?,
+        package_nonce,
     )
     .map_err(|error| format!("lock package: {error:?}"))?;
     let keyper_dirs = create_devnet_keyper_directories(&private_root, rpc_url, &attesters)?;
@@ -941,6 +1120,20 @@ pub fn devnet_proof(
         dealer.share(epoch, 1),
         dealer.share(epoch, 2),
     ];
+    private_material.extend(
+        keyper_dirs
+            .iter()
+            .map(|directory| directory.path().as_os_str().as_encoded_bytes().to_vec()),
+    );
+    for share in &keyper_shares {
+        private_material.push(
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .serialize(&SerdeSecret(share.secret()))
+                .map_err(|_| "encode private keyper share failed".to_owned())?,
+        );
+    }
     let lock_approvals = [0_usize, 1]
         .into_iter()
         .map(|index| {
@@ -991,10 +1184,12 @@ pub fn devnet_proof(
     let confirmed = ProgramClient::new(rpc_url)
         .fetch_confirmed_lock(epoch)
         .map_err(|error| format!("confirmed lock: {error:?}"))?;
+    let settlement_nonce = random_bytes()?;
+    private_material.push(settlement_nonce.to_vec());
     let settlement = SettlementRequestV1::build(
         package.clone(),
         decryption_evidence,
-        random_bytes()?,
+        settlement_nonce,
         &confirmed,
     )
     .map_err(|error| format!("settlement request: {error:?}"))?;
@@ -1080,26 +1275,38 @@ pub fn devnet_proof(
     {
         finalized_transactions.push(wait_for_finalized_transaction(rpc_url, signature)?);
     }
-    let funding_evidence: [FundingTransactionEvidenceV1; 4] = participant_wallets
-        .iter()
-        .zip(funding_signatures.iter())
-        .zip(&finalized_transactions[..4])
-        .map(
-            |((wallet, signature), transaction)| FundingTransactionEvidenceV1 {
-                authority: wallet.pubkey().to_string(),
-                transaction: EvidenceTransactionV1 {
-                    signature: signature.to_string(),
-                    slot: transaction.slot,
-                },
+    let mut funding_evidence = Vec::with_capacity(4);
+    for index in 0..4 {
+        let wallet = participant_wallets
+            .get(index)
+            .ok_or("four participant wallets required")?;
+        let signature = funding_signatures
+            .get(index)
+            .ok_or("four funding signatures required")?;
+        let (base_source, quote_source) = funding_sources
+            .get(index)
+            .ok_or("four funding source pairs required")?;
+        let transaction = finalized_transactions
+            .get(index)
+            .ok_or("four finalized funding transactions required")?;
+        funding_evidence.push(FundingTransactionEvidenceV1 {
+            authority: wallet.pubkey().to_string(),
+            base_source: base_source.to_string(),
+            quote_source: quote_source.to_string(),
+            transaction: EvidenceTransactionV1 {
+                signature: signature.to_string(),
+                slot: transaction.slot,
             },
-        )
-        .collect::<Vec<_>>()
+        });
+    }
+    let funding_evidence: [FundingTransactionEvidenceV1; 4] = funding_evidence
         .try_into()
         .map_err(|_| "four funding records required".to_owned())?;
     let configuration_hash = package.configuration.digest();
     let mut content = DevnetEvidenceContentV1 {
         cluster: "devnet".to_owned(),
         public_commit,
+        build_toolchain,
         checkpoint_artifact_len: artifact.len(),
         checkpoint_artifact_sha256,
         deployment: EvidenceDeploymentV1 {
@@ -1177,21 +1384,18 @@ pub fn devnet_proof(
         .map_err(|error| format!("seal devnet evidence: {error:?}"))?;
     crate::verify_devnet_evidence_at_rpc(&bundle, &artifact, rpc_url)
         .map_err(|error| format!("verify devnet evidence before write: {error:?}"))?;
-    let verifier_artifact = run_directory.path().join("checkpoint.so");
-    write_private_file(&verifier_artifact, &artifact)?;
-    persist_verified_evidence(out, rpc_url, &bundle, &verifier_artifact)?;
+    persist_verified_evidence(out, rpc_url, &bundle, &private_material)?;
     Ok(format!(
-        "LOCKED: crowd 4/4\nSETTLED: one aggregate BUY 2 lots\nVERIFIED: finalized {}\nEVIDENCE: {}\n{NON_CLAIM}\n",
-        settlement_signature,
-        out.display()
+        "LOCKED: crowd 4/4\nSETTLED: one aggregate BUY 2 lots\nVERIFIED: evidence {} settlement {}\n{NON_CLAIM}\n",
+        bundle.evidence_sha256, settlement_signature
     ))
 }
 
-fn clean_public_checkpoint_artifact() -> Result<(String, Vec<u8>), String> {
+fn clean_public_checkpoint_artifact() -> Result<(String, CanonicalCheckpointV1), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
-        .map_err(|error| format!("resolve repository root: {error}"))?;
+        .map_err(|_| "resolve repository root failed".to_owned())?;
     let status = command_stdout(
         Command::new("git")
             .arg("status")
@@ -1208,105 +1412,201 @@ fn clean_public_checkpoint_artifact() -> Result<(String, Vec<u8>), String> {
     )?
     .trim()
     .to_owned();
-    let branch = command_stdout(
-        Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(&root),
-    )?
-    .trim()
-    .to_owned();
-    if branch.is_empty() {
-        return Err("public checkpoint cannot use a detached HEAD".to_owned());
-    }
-    let remote = command_stdout(
-        Command::new("git")
-            .args(["ls-remote", "--heads", "origin", &branch])
-            .current_dir(&root),
-    )?;
-    if remote.split_whitespace().next() != Some(commit.as_str()) {
-        return Err(format!(
-            "push checkpoint commit {commit} to origin/{branch} before devnet"
-        ));
-    }
-    let clean = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let checkout = clean.path().join("checkpoint");
-    command_stdout(
-        Command::new("git")
-            .args(["clone", "--quiet", "--no-hardlinks"])
-            .arg(&root)
-            .arg(&checkout),
-    )?;
-    command_stdout(
-        Command::new("git")
-            .args(["checkout", "--quiet", "--detach", &commit])
-            .current_dir(&checkout),
-    )?;
-    let cargo = resolve_cargo()?;
-    let build = Command::new(cargo)
-        .args(["build-sbf", "--manifest-path"])
-        .arg(checkout.join("crates/kageb-program/Cargo.toml"))
-        .current_dir(&checkout)
-        .output()
-        .map_err(|error| format!("launch clean cargo build-sbf: {error}"))?;
-    if !build.status.success() {
-        return Err(format!(
-            "clean checkpoint cargo build-sbf failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        ));
-    }
-    let artifact = fs::read(checkout.join("target/deploy/kageb_program.so"))
-        .map_err(|error| format!("read clean checkpoint artifact: {error}"))?;
-    if !artifact.starts_with(b"\x7fELF") {
-        return Err("clean checkpoint artifact is not ELF".to_owned());
-    }
-    Ok((commit, artifact))
+    let checkpoint = build_canonical_checkpoint(&commit)?;
+    Ok((commit, checkpoint))
 }
 
 fn command_stdout(command: &mut Command) -> Result<String, String> {
     let output = command
         .output()
-        .map_err(|error| format!("launch command: {error}"))?;
+        .map_err(|_| "repository command failed to launch".to_owned())?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        return Err("repository command failed".to_owned());
     }
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    String::from_utf8(output.stdout).map_err(|_| "repository command returned non-UTF-8".to_owned())
 }
 
-fn require_devnet_setup_balance(rpc: &RpcClient, payer: &Keypair) -> Result<(), String> {
+fn fetch_deployed_checkpoint(
+    rpc: &RpcClient,
+    artifact_len: usize,
+) -> Result<Option<crate::ExtractedUpgradeableProgramV1>, String> {
+    let programdata_address =
+        Pubkey::find_program_address(&[ID.as_ref()], &UPGRADEABLE_LOADER_ID).0;
+    let program = rpc
+        .get_account_with_commitment(&ID, CommitmentConfig::finalized())
+        .map_err(|_| "read fixed program account failed".to_owned())?
+        .value;
+    let programdata = rpc
+        .get_account_with_commitment(&programdata_address, CommitmentConfig::finalized())
+        .map_err(|_| "read fixed ProgramData account failed".to_owned())?
+        .value;
+    let (program, programdata) = match (program, programdata) {
+        (None, None) => return Ok(None),
+        (Some(program), Some(programdata)) => (program, programdata),
+        _ => return Err("fixed deployment accounts are incomplete".to_owned()),
+    };
+    extract_upgradeable_program(
+        &PublicAccountSnapshotV1 {
+            owner: program.owner,
+            executable: program.executable,
+            data: program.data,
+        },
+        programdata_address,
+        &PublicAccountSnapshotV1 {
+            owner: programdata.owner,
+            executable: programdata.executable,
+            data: programdata.data,
+        },
+        artifact_len,
+    )
+    .map(Some)
+    .map_err(|error| format!("extract fixed deployment failed: {error:?}"))
+}
+
+fn resolve_external_program_keypair() -> Result<Keypair, String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|_| "resolve repository root failed".to_owned())?;
+    let configured = std::env::var_os("KAGEB_PROGRAM_KEYPAIR").map(PathBuf::from);
+    let path = configured
+        .clone()
+        .unwrap_or_else(|| root.join("target/deploy/kageb_program-keypair.json"));
+    if configured.is_none()
+        && !fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return Err(
+            "initial deployment needs KAGEB_PROGRAM_KEYPAIR or the ignored target symlink"
+                .to_owned(),
+        );
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "resolve external program key failed".to_owned())?;
+    if canonical.starts_with(&root) {
+        return Err("program key must live outside the public repository".to_owned());
+    }
+    let keypair =
+        read_keypair_file(&canonical).map_err(|_| "read external program key failed".to_owned())?;
+    if keypair.pubkey() != ID {
+        return Err("external program key does not match the fixed program ID".to_owned());
+    }
+    Ok(keypair)
+}
+
+fn devnet_peak_rents(rpc: &RpcClient, artifact_len: usize) -> Result<DevnetPeakRents, String> {
     let mint_rent = rpc
         .get_minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN)
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "read mint rent failed".to_owned())?;
     let token_rent = rpc
         .get_minimum_balance_for_rent_exemption(spl_token_interface::state::Account::LEN)
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "read token rent failed".to_owned())?;
     let state_rent = rpc
         .get_minimum_balance_for_rent_exemption(kageb_program::state::STATE_LEN)
-        .map_err(|error| error.to_string())?;
-    let required = mint_rent
+        .map_err(|_| "read state rent failed".to_owned())?;
+    let setup = mint_rent
         .checked_mul(2)
         .and_then(|value| value.checked_add(token_rent.checked_mul(12)?))
         .and_then(|value| value.checked_add(state_rent.checked_mul(2)?))
-        .and_then(|value| value.checked_add(10_000_000))
         .ok_or("devnet setup balance overflow")?;
+    let program = rpc
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program())
+        .map_err(|_| "read program rent failed".to_owned())?;
+    let programdata = rpc
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_programdata(
+            artifact_len,
+        ))
+        .map_err(|_| "read ProgramData rent failed".to_owned())?;
+    let buffer = rpc
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_buffer(
+            artifact_len,
+        ))
+        .map_err(|_| "read deploy buffer rent failed".to_owned())?;
+    Ok(DevnetPeakRents {
+        setup,
+        program,
+        programdata,
+        buffer,
+        fees: 20_000_000,
+    })
+}
+
+fn require_devnet_peak_balance(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    action: DevnetDeploymentAction,
+    artifact_len: usize,
+) -> Result<(), String> {
+    let required = required_peak_balance(action, devnet_peak_rents(rpc, artifact_len)?)?;
     let available = rpc
         .get_balance(&payer.pubkey())
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "read devnet payer balance failed".to_owned())?;
     if available < required {
         return Err(format!(
-            "devnet payer needs at least {required} lamports after deployment; available {available}"
+            "devnet payer needs {required} lamports at peak; available {available}"
         ));
+    }
+    Ok(())
+}
+
+fn write_private_keypair(path: &Path, keypair: &Keypair) -> Result<(), String> {
+    let encoded = serde_json::to_vec(&keypair.to_bytes().to_vec())
+        .map_err(|_| "encode private key failed".to_owned())?;
+    write_private_file(path, &encoded)
+}
+
+fn deploy_checkpoint(
+    rpc_url: &str,
+    payer: &Keypair,
+    initial_program_key: Option<&Keypair>,
+    action: DevnetDeploymentAction,
+    private_directory: &Path,
+    artifact: &[u8],
+) -> Result<(), String> {
+    let artifact_path = private_directory.join("checkpoint.so");
+    let payer_path = private_directory.join("deploy-payer.json");
+    write_private_file(&artifact_path, artifact)?;
+    write_private_keypair(&payer_path, payer)?;
+    let program_id = if action == DevnetDeploymentAction::Initial {
+        let keypair = initial_program_key.ok_or("initial program key is missing")?;
+        let program_path = private_directory.join("deploy-program.json");
+        write_private_keypair(&program_path, keypair)?;
+        program_path.into_os_string()
+    } else {
+        ID.to_string().into()
+    };
+    let solana = resolve_on_path("solana")?;
+    let output = Command::new(solana)
+        .args(["program", "deploy"])
+        .arg(&artifact_path)
+        .args(["--url", rpc_url, "--commitment", "finalized", "--use-rpc"])
+        .arg("--fee-payer")
+        .arg(&payer_path)
+        .arg("--keypair")
+        .arg(&payer_path)
+        .arg("--upgrade-authority")
+        .arg(&payer_path)
+        .arg("--program-id")
+        .arg(program_id)
+        .args(["--output", "json"])
+        .output()
+        .map_err(|_| "launch Solana program deploy failed".to_owned())?;
+    if !output.status.success() {
+        return Err("Solana program deploy failed".to_owned());
     }
     Ok(())
 }
 
 fn private_runtime_root() -> Result<PathBuf, String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kageb-private");
-    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&root).map_err(|_| "create private runtime failed".to_owned())?;
     #[cfg(unix)]
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
-    root.canonicalize().map_err(|error| error.to_string())
+        .map_err(|_| "secure private runtime failed".to_owned())?;
+    root.canonicalize()
+        .map_err(|_| "resolve private runtime failed".to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1352,14 +1652,17 @@ fn create_devnet_keyper_directories(
     attesters: &[SigningKey; 3],
 ) -> Result<[TempDir; 3], String> {
     let directories = [
-        tempfile::tempdir_in(private_root).map_err(|error| error.to_string())?,
-        tempfile::tempdir_in(private_root).map_err(|error| error.to_string())?,
-        tempfile::tempdir_in(private_root).map_err(|error| error.to_string())?,
+        tempfile::tempdir_in(private_root)
+            .map_err(|_| "create private keyper runtime failed".to_owned())?,
+        tempfile::tempdir_in(private_root)
+            .map_err(|_| "create private keyper runtime failed".to_owned())?,
+        tempfile::tempdir_in(private_root)
+            .map_err(|_| "create private keyper runtime failed".to_owned())?,
     ];
     for index in 0..3 {
         #[cfg(unix)]
         fs::set_permissions(directories[index].path(), fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "secure private keyper runtime failed".to_owned())?;
         write_private_file(
             &directories[index].path().join("keyper-rpc-url"),
             rpc_url.as_bytes(),
@@ -1471,40 +1774,42 @@ fn persist_verified_evidence(
     out: &Path,
     rpc_url: &str,
     bundle: &DevnetEvidenceBundleV1,
-    checkpoint_artifact: &Path,
+    private_material: &[Vec<u8>],
 ) -> Result<(), String> {
-    let parent = out.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let pending = out.with_extension("json.pending");
-    let json = bundle
+    let mut bytes = bundle
         .to_json_pretty()
-        .map_err(|error| format!("encode evidence: {error:?}"))?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(&pending)
-        .map_err(|error| format!("create pending evidence: {error}"))?;
-    file.write_all(json.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("write pending evidence: {error}"))?;
-    drop(file);
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let verify = Command::new(executable)
-        .args(["verify", "evidence"])
-        .arg(&pending)
+        .map_err(|_| "encode evidence failed".to_owned())?
+        .into_bytes();
+    bytes.push(b'\n');
+    scan_public_evidence_bytes(&bytes, &private_material_encodings(private_material))?;
+
+    let executable =
+        std::env::current_exe().map_err(|_| "locate fresh evidence verifier failed".to_owned())?;
+    let mut child = Command::new(executable)
+        .args(["verify", "evidence", "-"])
         .args(["--rpc", rpc_url])
-        .env("KAGEB_CHECKPOINT_ARTIFACT", checkpoint_artifact)
-        .output()
-        .map_err(|error| format!("launch fresh evidence verifier: {error}"))?;
-    if !verify.status.success() {
-        let _ = fs::remove_file(&pending);
-        return Err(format!(
-            "fresh evidence verifier failed: {}",
-            String::from_utf8_lossy(&verify.stderr).trim()
-        ));
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "launch fresh evidence verifier failed".to_owned())?;
+    child
+        .stdin
+        .take()
+        .ok_or("fresh evidence verifier stdin missing")?
+        .write_all(&bytes)
+        .map_err(|_| "write fresh evidence verifier input failed".to_owned())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "wait for fresh evidence verifier failed".to_owned())?;
+    let expected = format!(
+        "VERIFIED: evidence {} settlement {}\n",
+        bundle.evidence_sha256, bundle.content.transactions.settlement.signature
+    );
+    if !output.status.success() || output.stdout != expected.as_bytes() {
+        return Err("fresh evidence verifier failed".to_owned());
     }
-    fs::rename(&pending, out).map_err(|error| format!("publish verified evidence: {error}"))
+    publish_bytes_noclobber(out, &bytes)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -2088,12 +2393,12 @@ fn recursive_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Str
     Ok(())
 }
 
-fn resolve_on_path(executable: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_on_path(executable: &str) -> Result<PathBuf, String> {
     executable_on_path(executable)
         .ok_or_else(|| format!("{executable} was not found as an executable on PATH"))
 }
 
-fn resolve_cargo() -> Result<PathBuf, String> {
+pub(crate) fn resolve_cargo() -> Result<PathBuf, String> {
     if let Some(cargo) = std::env::var_os("CARGO") {
         return verified_executable(PathBuf::from(cargo), "CARGO");
     }
@@ -2497,10 +2802,12 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    let mut file = options
+        .open(path)
+        .map_err(|_| "create private file failed".to_owned())?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())
+        .map_err(|_| "write private file failed".to_owned())
 }
 
 fn lock_verifier(approval: &crate::LockApprovalV1, digest: &[u8; 32]) -> Instruction {
@@ -2522,4 +2829,143 @@ fn token_amount(rpc: &RpcClient, address: &Pubkey) -> Result<u64, String> {
         .try_into()
         .map_err(|_| "invalid token amount")?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod devnet_tests {
+    use super::*;
+
+    fn deployed(
+        executable: &[u8],
+        authority: Option<Pubkey>,
+    ) -> crate::ExtractedUpgradeableProgramV1 {
+        crate::ExtractedUpgradeableProgramV1 {
+            deployment_slot: 10,
+            upgrade_authority: authority,
+            executable: executable.to_vec(),
+            executable_sha256: hex_sha256(executable),
+        }
+    }
+
+    #[test]
+    fn deployment_action_is_noop_initial_or_authorized_upgrade() {
+        let payer = Pubkey::new_unique();
+        let artifact = b"\x7fELFcheckpoint";
+        assert_eq!(
+            select_deployment_action(None, artifact, payer, Some(ID)).unwrap(),
+            DevnetDeploymentAction::Initial
+        );
+        assert_eq!(
+            select_deployment_action(Some(&deployed(artifact, None)), artifact, payer, None)
+                .unwrap(),
+            DevnetDeploymentAction::Noop
+        );
+        assert_eq!(
+            select_deployment_action(
+                Some(&deployed(b"\x7fELFold", Some(payer))),
+                artifact,
+                payer,
+                None,
+            )
+            .unwrap(),
+            DevnetDeploymentAction::Upgrade
+        );
+        assert!(select_deployment_action(
+            Some(&deployed(b"\x7fELFold", Some(Pubkey::new_unique()))),
+            artifact,
+            payer,
+            None,
+        )
+        .is_err());
+        assert!(
+            select_deployment_action(None, artifact, payer, Some(Pubkey::new_unique())).is_err()
+        );
+    }
+
+    #[test]
+    fn peak_balance_and_deadline_math_fail_closed_on_overflow() {
+        let rents = DevnetPeakRents {
+            setup: 10,
+            program: 20,
+            programdata: 30,
+            buffer: 40,
+            fees: 50,
+        };
+        assert_eq!(
+            required_peak_balance(DevnetDeploymentAction::Noop, rents),
+            Ok(60)
+        );
+        assert_eq!(
+            required_peak_balance(DevnetDeploymentAction::Initial, rents),
+            Ok(150)
+        );
+        assert!(required_peak_balance(
+            DevnetDeploymentAction::Initial,
+            DevnetPeakRents {
+                setup: u64::MAX,
+                ..rents
+            },
+        )
+        .is_err());
+        assert!(checked_devnet_deadlines(i64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn evidence_publication_never_clobbers_an_existing_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("proof.json");
+        fs::write(&output, b"winner").unwrap();
+
+        assert!(publish_bytes_noclobber(&output, b"loser").is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"winner");
+    }
+
+    #[test]
+    fn concurrent_evidence_publication_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("proof.json");
+        let barrier = Arc::new(Barrier::new(2));
+        let attempts: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let output = output.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    publish_bytes_noclobber(&output, bytes)
+                })
+            })
+            .collect();
+        let results: Vec<_> = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(matches!(
+            fs::read(&output).unwrap().as_slice(),
+            b"first" | b"second"
+        ));
+    }
+
+    #[test]
+    fn public_evidence_scan_rejects_secret_encodings_and_private_terms() {
+        assert!(scan_public_evidence_bytes(b"{\"ok\":true}", &[b"secret".to_vec()]).is_ok());
+        assert!(
+            scan_public_evidence_bytes(b"{\"value\":\"secret\"}", &[b"secret".to_vec()]).is_err()
+        );
+        assert!(scan_public_evidence_bytes(b"{\"plaintext_orders\":[]}", &[]).is_err());
+        assert!(scan_public_evidence_bytes(b"{\"path\":\".kageb-private/run\"}", &[]).is_err());
+
+        let secret = vec![0x41; 32];
+        let encodings = private_material_encodings(&[secret]);
+        for encoded in encodings {
+            let mut json = b"{\"value\":\"".to_vec();
+            json.extend_from_slice(&encoded);
+            json.extend_from_slice(b"\"}");
+            assert!(scan_public_evidence_bytes(&json, &[encoded]).is_err());
+        }
+    }
 }
