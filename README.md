@@ -84,12 +84,12 @@ The verifier checks the content hash, fetches finalized Devnet transactions and 
 Expected result:
 
 ```text
-VERIFIED: evidence 93e0431db99e154382af2fadba6a9e60bd1bfea50096e115401a3e601d8f2198 settlement 3k8Usa12jhcQPxGYkjsqE5T9Ens4h3RHoiL8yH5cqfkoHmac7q6bch97FTfxetSAyLL2cNp41eF4g2uQcvqUM6D5
+VERIFIED: evidence 44a20bb076c4a0165fae8aed88491533f1150e253d2c7d91ea391897bb8c9e80 settlement 3jz3CBFQB7YNhV1SauMTE9NHECe7TXKtAQcAhZ8dwCRz4XmhBg3oj49jaKQVCzM47W3oxSLN8gEF1kPX2uhNvrca
 ```
 
 - Program: [`HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77`](https://explorer.solana.com/address/HbMyCP5GxicksRpSVrchRTJTznP3zTrzCMb7FmZNRa77?cluster=devnet)
-- Lock: [`4N1kxRiW7KZ4G8WN5WqPkSG6aX1y8xHYMoWZ5cBeYQk3Dr5pMjBsWEiwTtMm2QYLQMyHrVD9BMmq8pZWnx8TAxRt`](https://explorer.solana.com/tx/4N1kxRiW7KZ4G8WN5WqPkSG6aX1y8xHYMoWZ5cBeYQk3Dr5pMjBsWEiwTtMm2QYLQMyHrVD9BMmq8pZWnx8TAxRt?cluster=devnet)
-- Aggregate settlement: [`3k8Usa12jhcQPxGYkjsqE5T9Ens4h3RHoiL8yH5cqfkoHmac7q6bch97FTfxetSAyLL2cNp41eF4g2uQcvqUM6D5`](https://explorer.solana.com/tx/3k8Usa12jhcQPxGYkjsqE5T9Ens4h3RHoiL8yH5cqfkoHmac7q6bch97FTfxetSAyLL2cNp41eF4g2uQcvqUM6D5?cluster=devnet)
+- Lock: [`31x1WyxPKqSj6sZCmVpHqMEKh38NhKKHewBZuvc9XpUgsLiCwwxXQgF3yApjW2TnFzAsEXvpRoCtDS23dnfXT4MX`](https://explorer.solana.com/tx/31x1WyxPKqSj6sZCmVpHqMEKh38NhKKHewBZuvc9XpUgsLiCwwxXQgF3yApjW2TnFzAsEXvpRoCtDS23dnfXT4MX?cluster=devnet)
+- Aggregate settlement: [`3jz3CBFQB7YNhV1SauMTE9NHECe7TXKtAQcAhZ8dwCRz4XmhBg3oj49jaKQVCzM47W3oxSLN8gEF1kPX2uhNvrca`](https://explorer.solana.com/tx/3jz3CBFQB7YNhV1SauMTE9NHECe7TXKtAQcAhZ8dwCRz4XmhBg3oj49jaKQVCzM47W3oxSLN8gEF1kPX2uhNvrca?cluster=devnet)
 - Evidence: [`evidence/devnet.json`](evidence/devnet.json)
 
 The evidence is content-addressed and tamper-evident. It is not signed evidence. The deployed program retains a provisional upgrade authority, so the deployment is not immutable.
