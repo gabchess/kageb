@@ -1796,7 +1796,13 @@ where
         command
             .args(["program", "deploy"])
             .arg(&artifact_path)
-            .args(["--url", rpc_url, "--commitment", "finalized", "--use-rpc"])
+            .args([
+                "--url",
+                rpc_url,
+                "--commitment",
+                "finalized",
+                "--use-tpu-client",
+            ])
             .arg("--fee-payer")
             .arg(&payer_path)
             .arg("--keypair")
@@ -3309,6 +3315,11 @@ mod devnet_tests {
                     artifact.len().to_string()
                 );
                 assert_eq!(argument_after(command, "--max-sign-attempts"), "20");
+                let arguments = command_args(command);
+                assert!(arguments
+                    .iter()
+                    .any(|argument| argument == "--use-tpu-client"));
+                assert!(!arguments.iter().any(|argument| argument == "--use-rpc"));
                 for flag in ["--fee-payer", "--program-id", "--buffer"] {
                     let path = PathBuf::from(argument_after(command, flag));
                     assert!(path.exists());
