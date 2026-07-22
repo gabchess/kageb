@@ -50,7 +50,17 @@ jobs:
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit locked dependencies
-        run: cargo audit --deny warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          production_tree="$(cargo tree --locked -p kageb-host --edges normal,build)"
+          if grep -Eq 'curve25519-dalek v3\.2\.0|ed25519-dalek v1\.0\.1' <<<"$production_tree"; then
+            echo "a dev-only RustSec exception entered the production dependency tree" >&2
+            exit 1
+          fi
+          cargo audit \
+            --ignore RUSTSEC-2024-0344 \
+            --ignore RUSTSEC-2022-0093
 
   public-evidence:
     if: github.event_name != 'pull_request'

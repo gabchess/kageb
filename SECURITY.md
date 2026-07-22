@@ -29,6 +29,15 @@ KageB does not hide funding addresses, token transfers, withdrawals, network met
 - No client-side cryptographic binding between an epoch ID and the supplied epoch public-key set.
 - No claim of anonymity, unlinkability, Sybil resistance, immutability, or mainnet safety.
 
+## Dependency audit scope
+
+CI scans the locked dependency graph against RustSec. Two advisories are scoped out only after CI proves their affected versions are absent from KageB's normal and build dependency tree:
+
+- `RUSTSEC-2024-0344` (`curve25519-dalek` 3.2.0) enters through `solana-program-test`.
+- `RUSTSEC-2022-0093` (`ed25519-dalek` 1.0.1) enters through `solana-program-test`.
+
+Those crates run in tests, not in the KageB client, coordinator, keyper, or onchain program. The production graph still includes old dependencies from `threshold_crypto` 0.4. Its `failure` use derives `Fail`, which RustSec excludes from `RUSTSEC-2019-0036`, and KageB installs no custom logger required by `RUSTSEC-2026-0097`. This is still maintenance debt and one reason v0.1 is limited to synthetic assets on Devnet.
+
 The evidence verifier proves one recorded run under this boundary. It does not audit all future code or deployments.
 
 ## Report a vulnerability

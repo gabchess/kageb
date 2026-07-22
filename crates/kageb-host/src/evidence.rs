@@ -1176,8 +1176,10 @@ pub fn verify_evidence_file(path: &Path, rpc_url: &str) -> Result<String, String
         .verify_content_hash()
         .map_err(|error| format!("verify evidence content address: {error:?}"))?;
     let checkpoint = build_canonical_checkpoint(&bundle.content.public_commit)?;
-    if checkpoint.build_toolchain != bundle.content.build_toolchain {
-        return Err("canonical checkpoint build toolchain differs from evidence".to_owned());
+    if let Some(mismatch) =
+        build_toolchain_mismatch(&bundle.content.build_toolchain, &checkpoint.build_toolchain)
+    {
+        return Err(mismatch);
     }
     verify_devnet_evidence_at_rpc(&bundle, &checkpoint.artifact, rpc_url)
         .map_err(|error| format!("verify finalized devnet evidence: {error:?}"))?;
@@ -1185,6 +1187,34 @@ pub fn verify_evidence_file(path: &Path, rpc_url: &str) -> Result<String, String
         "VERIFIED: evidence {} settlement {}\n",
         bundle.evidence_sha256, bundle.content.transactions.settlement.signature
     ))
+}
+
+fn build_toolchain_mismatch(
+    expected: &EvidenceBuildToolchainV1,
+    observed: &EvidenceBuildToolchainV1,
+) -> Option<String> {
+    [
+        ("host_rustc", &expected.host_rustc, &observed.host_rustc),
+        (
+            "cargo_build_sbf",
+            &expected.cargo_build_sbf,
+            &observed.cargo_build_sbf,
+        ),
+        (
+            "platform_tools",
+            &expected.platform_tools,
+            &observed.platform_tools,
+        ),
+        ("sbf_rustc", &expected.sbf_rustc, &observed.sbf_rustc),
+        ("solana_cli", &expected.solana_cli, &observed.solana_cli),
+    ]
+    .into_iter()
+    .find(|(_, expected, observed)| expected != observed)
+    .map(|(field, expected, observed)| {
+        format!(
+            "canonical checkpoint {field} differs from evidence: expected {expected:?}, observed {observed:?}"
+        )
+    })
 }
 
 fn read_evidence_input(path: &Path) -> Result<String, String> {
@@ -2442,5 +2472,27 @@ mod tests {
             validate_rpc_response_len(7, 6),
             Err(DevnetEvidenceError::RpcUnavailable)
         );
+    }
+
+    #[test]
+    fn build_toolchain_mismatch_names_the_first_changed_identity() {
+        let expected = EvidenceBuildToolchainV1 {
+            host_rustc: "rustc 1.95.0".to_owned(),
+            cargo_build_sbf: "cargo-build-sbf 4.0.0".to_owned(),
+            platform_tools: "platform-tools v1.53".to_owned(),
+            sbf_rustc: "rustc 1.89.0".to_owned(),
+            solana_cli: "solana-cli 4.0.1".to_owned(),
+        };
+        let mut observed = expected.clone();
+        observed.platform_tools = "platform-tools v1.54".to_owned();
+
+        assert_eq!(
+            build_toolchain_mismatch(&expected, &observed),
+            Some(
+                "canonical checkpoint platform_tools differs from evidence: expected \"platform-tools v1.53\", observed \"platform-tools v1.54\""
+                    .to_owned()
+            )
+        );
+        assert_eq!(build_toolchain_mismatch(&expected, &expected), None);
     }
 }
