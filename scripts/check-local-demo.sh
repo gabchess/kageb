@@ -23,7 +23,10 @@ if ! cmp -s "$first" "$second"; then
 fi
 
 grep -Fqx "SETTLED: one aggregate" "$first"
+grep -Fqx "QUORUM: all 3 two-share paths agree" "$first"
+grep -Fqx "RESULTS: authenticated balances persisted" "$first"
 grep -Fqx "BALANCED: zero residual; no venue leg" "$first"
+grep -Fqx "EXPIRED: underfilled; reservations released" "$first"
 grep -Fqx "OBSERVER: direct 4 orders; KageB 1 aggregate" "$first"
 cat "$first"
 echo "local demo is deterministic"

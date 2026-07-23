@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{crypto::FundedAuthorizationV1, PoolBalance};
 
-const HEADER: [u8; 8] = *b"KGBRSV1\0";
-const RECORD_LEN: usize = 81;
+const HEADER: [u8; 8] = *b"KGBRSV2\0";
+const RECORD_LEN: usize = 113;
 const CHECKSUM_LEN: usize = 32;
 const LOCK_ATTEMPTS: usize = 100;
 const SUSPENSION_HEADER: [u8; 8] = *b"KGBSUS1\0";
@@ -46,6 +46,7 @@ impl TryFrom<u8> for ReservationState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservationRecord {
     nonce: [u8; 32],
+    epoch_id: [u8; 32],
     participant_id: [u8; 32],
     base_atoms: u64,
     quote_atoms: u64,
@@ -56,6 +57,7 @@ pub struct ReservationRecord {
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsignedFundedAuthorizationV1 {
     nonce: [u8; 32],
+    epoch_id: [u8; 32],
     participant_id: [u8; 32],
     base_atoms: u64,
     quote_atoms: u64,
@@ -72,9 +74,10 @@ impl UnsignedFundedAuthorizationV1 {
         self.participant_id
     }
 
-    pub(crate) const fn into_parts(self) -> ([u8; 32], [u8; 32], u64, u64) {
+    pub(crate) const fn into_parts(self) -> ([u8; 32], [u8; 32], [u8; 32], u64, u64) {
         (
             self.nonce,
+            self.epoch_id,
             self.participant_id,
             self.base_atoms,
             self.quote_atoms,
@@ -108,17 +111,24 @@ impl SubmissionV1 {
 }
 
 impl ReservationRecord {
-    pub const fn new(
+    pub fn new(
         nonce: [u8; 32],
+        epoch_id: [u8; 32],
         participant_id: [u8; 32],
         base_atoms: u64,
         quote_atoms: u64,
     ) -> Result<Self, JournalError> {
-        if base_atoms == 0 || quote_atoms == 0 {
+        if nonce == [0; 32]
+            || epoch_id == [0; 32]
+            || participant_id == [0; 32]
+            || base_atoms == 0
+            || quote_atoms == 0
+        {
             return Err(JournalError::InvalidAmount);
         }
         Ok(Self {
             nonce,
+            epoch_id,
             participant_id,
             base_atoms,
             quote_atoms,
@@ -131,27 +141,31 @@ impl ReservationRecord {
             return Err(JournalError::Corrupt);
         }
         let nonce = bytes[0..32].try_into().map_err(|_| JournalError::Corrupt)?;
-        let participant_id = bytes[32..64]
+        let epoch_id = bytes[32..64]
+            .try_into()
+            .map_err(|_| JournalError::Corrupt)?;
+        let participant_id = bytes[64..96]
             .try_into()
             .map_err(|_| JournalError::Corrupt)?;
         let base_atoms = u64::from_le_bytes(
-            bytes[64..72]
+            bytes[96..104]
                 .try_into()
                 .map_err(|_| JournalError::Corrupt)?,
         );
         let quote_atoms = u64::from_le_bytes(
-            bytes[72..80]
+            bytes[104..112]
                 .try_into()
                 .map_err(|_| JournalError::Corrupt)?,
         );
-        let mut record = Self::new(nonce, participant_id, base_atoms, quote_atoms)
+        let mut record = Self::new(nonce, epoch_id, participant_id, base_atoms, quote_atoms)
             .map_err(|_| JournalError::Corrupt)?;
-        record.state = ReservationState::try_from(bytes[80])?;
+        record.state = ReservationState::try_from(bytes[112])?;
         Ok(record)
     }
 
     fn encode_into(self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&self.epoch_id);
         bytes.extend_from_slice(&self.participant_id);
         bytes.extend_from_slice(&self.base_atoms.to_le_bytes());
         bytes.extend_from_slice(&self.quote_atoms.to_le_bytes());
@@ -233,6 +247,7 @@ impl ReservationJournal {
         })?;
         Ok(UnsignedFundedAuthorizationV1 {
             nonce: record.nonce,
+            epoch_id: record.epoch_id,
             participant_id: record.participant_id,
             base_atoms: record.base_atoms,
             quote_atoms: record.quote_atoms,
@@ -250,6 +265,86 @@ impl ReservationJournal {
     #[must_use]
     pub fn state(&self, nonce: [u8; 32]) -> Option<ReservationState> {
         self.records.get(&nonce).map(|record| record.state)
+    }
+
+    pub(crate) fn finalize_epoch<E>(
+        &mut self,
+        epoch_id: [u8; 32],
+        nonces: &[[u8; 32]],
+        expected_members: &BTreeSet<[u8; 32]>,
+        apply: impl FnOnce(bool) -> Result<(), E>,
+    ) -> Result<Result<(), E>, JournalError> {
+        let _lock = acquire_journal_lock(&self.path)?;
+        let mut current = load_records(&self.path)?;
+        let mut seen_nonces = BTreeSet::new();
+        let mut members = BTreeSet::new();
+        let mut had_used = false;
+        for nonce in nonces {
+            if !seen_nonces.insert(*nonce) {
+                return Err(JournalError::InvalidTransition);
+            }
+            let record = current.get(nonce).ok_or(JournalError::UnknownNonce)?;
+            if record.epoch_id != epoch_id || record.state == ReservationState::Released {
+                return Err(JournalError::InvalidTransition);
+            }
+            had_used |= record.state == ReservationState::Used;
+            members.insert(record.participant_id);
+        }
+        if nonces.len() != expected_members.len() || members != *expected_members {
+            return Err(JournalError::InvalidTransition);
+        }
+        if let Err(error) = apply(had_used) {
+            return Ok(Err(error));
+        }
+        let mut changed = false;
+        for nonce in nonces {
+            let record = current.get_mut(nonce).ok_or(JournalError::UnknownNonce)?;
+            if record.state == ReservationState::Reserved {
+                record.state = ReservationState::Used;
+                changed = true;
+            }
+        }
+        if changed {
+            persist_records(&self.path, &current)?;
+        }
+        self.records = current;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn release_epoch_checked<E>(
+        &mut self,
+        epoch_id: [u8; 32],
+        nonces: &[[u8; 32]],
+        check: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<(), E>, JournalError> {
+        let _lock = acquire_journal_lock(&self.path)?;
+        let mut current = load_records(&self.path)?;
+        let mut seen = BTreeSet::new();
+        for nonce in nonces {
+            if !seen.insert(*nonce) {
+                return Err(JournalError::InvalidTransition);
+            }
+            let record = current.get(nonce).ok_or(JournalError::UnknownNonce)?;
+            if record.epoch_id != epoch_id || record.state == ReservationState::Used {
+                return Err(JournalError::InvalidTransition);
+            }
+        }
+        if let Err(error) = check() {
+            return Ok(Err(error));
+        }
+        let mut changed = false;
+        for nonce in nonces {
+            let record = current.get_mut(nonce).ok_or(JournalError::UnknownNonce)?;
+            if record.state == ReservationState::Reserved {
+                record.state = ReservationState::Released;
+                changed = true;
+            }
+        }
+        if changed {
+            persist_records(&self.path, &current)?;
+        }
+        self.records = current;
+        Ok(Ok(()))
     }
 
     fn transition(&mut self, nonce: [u8; 32], next: ReservationState) -> Result<(), JournalError> {
@@ -358,7 +453,7 @@ fn persist_records(
     Ok(())
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
 }
@@ -413,7 +508,6 @@ impl SuspensionRegistry {
     pub fn issue_authorization(
         &self,
         reserved: UnsignedFundedAuthorizationV1,
-        epoch_id: [u8; 32],
         trading_key: VerifyingKey,
         operator: &SigningKey,
         expiry_slot: u64,
@@ -424,7 +518,6 @@ impl SuspensionRegistry {
         }
         Ok(FundedAuthorizationV1::sign(
             reserved,
-            epoch_id,
             trading_key,
             operator,
             expiry_slot,
@@ -442,12 +535,12 @@ fn acquire_suspension_lock(registry_path: &Path) -> Result<AdvisoryLock, Suspens
     })
 }
 
-struct AdvisoryLock {
+pub(crate) struct AdvisoryLock {
     file: File,
 }
 
 impl AdvisoryLock {
-    fn acquire(path: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]

@@ -18,9 +18,9 @@ use ed25519_dalek::SigningKey;
 use kageb_program::{
     epoch_address,
     instruction::{
-        abort_instruction, create_epoch_instruction, initialize_pool_instruction, lock_instruction,
-        settle_instruction, CreateEpochArgs, InitializePoolAccounts, InitializePoolArgs,
-        SettleAccounts,
+        abort_instruction, create_epoch_instruction, expire_instruction,
+        initialize_pool_instruction, lock_instruction, settle_instruction, CreateEpochArgs,
+        InitializePoolAccounts, InitializePoolArgs, SettleAccounts,
     },
     pool_address,
     state::{EpochStateV1, EpochTerminalState, PoolStateV1},
@@ -53,17 +53,19 @@ use crate::evidence::{
     build_canonical_checkpoint, read_verified_checkpoint, CanonicalCheckpointV1,
 };
 use crate::{
-    admit_batch, content_root, extract_upgradeable_program, net_batch, run_keyper_release_share,
-    run_keyper_sign_lock, run_keyper_sign_settlement, AdmissionPolicyV1, BalanceRecordV1,
-    BatchConfig, CommitmentDomain, CryptoError, DecodedInstructionEvidenceV1, DecryptionEvidenceV1,
+    admit_batch, content_root, extract_upgradeable_program, finalize_settlement, net_batch,
+    prepare_order, release_reservations, run_keyper_release_share, run_keyper_sign_lock,
+    run_keyper_sign_settlement, AccountJournal, AdmissionPolicyV1, BalanceRecordV1, BatchConfig,
+    CommitmentDomain, CryptoError, DecodedInstructionEvidenceV1, DecryptionEvidenceV1,
     DevnetEvidenceBundleV1, DevnetEvidenceContentV1, DirectMarketAccounts, DirectOrder,
     EncryptedSubmissionV1, EpochDealer, EvidenceAccountsV1, EvidenceCommitmentsV1,
     EvidenceConfigurationV1, EvidenceDeploymentV1, EvidenceTokenBalancesV1, EvidenceTransactionV1,
     EvidenceTransactionsV1, FundedOrder, FundingTransactionEvidenceV1, IntentBodyV1,
     KagebObserverAccounts, KeyperProcessError, LedgerError, LockPackageV1, PoolBalance,
-    ProgramClient, PublicAccountSnapshotV1, PublicTrace, ReservationJournal, ReservationRecord,
-    SettlementRequestV1, Side, SignedBalanceSnapshotV1, SignedIntentV1, SuspensionError,
-    SuspensionRegistry, DEVNET_GENESIS_HASH, UPGRADEABLE_LOADER_ID,
+    PrepareOrderV1, ProgramClient, PublicAccountSnapshotV1, PublicTrace, ReservationJournal,
+    ReservationRecord, ReservationState, SettlementRequestV1, Side, SignedBalanceSnapshotV1,
+    SignedIntentV1, SuspensionError, SuspensionRegistry, DEVNET_GENESIS_HASH,
+    UPGRADEABLE_LOADER_ID,
 };
 
 const NON_CLAIM: &str = "It does not prove unique humans, production anonymity, private funding or withdrawal, a trustless exchange, protection from the KageB operator, or safe use with real funds.";
@@ -473,6 +475,8 @@ pub fn local_proof() -> Result<String, String> {
     )?;
 
     let private = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let mut accounts = AccountJournal::open(private.path().join("accounts.bin"))
+        .map_err(|error| format!("account journal: {error:?}"))?;
     let mut reservations = ReservationJournal::open(private.path().join("reservations.bin"))
         .map_err(|error| format!("reservation journal: {error:?}"))?;
     let suspensions = SuspensionRegistry::open(private.path().join("suspensions.bin"))
@@ -480,13 +484,23 @@ pub fn local_proof() -> Result<String, String> {
     let mut submissions = Vec::new();
     let mut signed_intents = Vec::new();
     let mut participant_ids = Vec::new();
+    let mut reservation_nonces = Vec::new();
+    let mut trading_keys = Vec::new();
     let current_slot = rpc.get_slot().map_err(|error| error.to_string())?;
     for side in direct_sides {
         let trading = random_signing_key()?;
         let participant_id = random_bytes()?;
+        let reservation_nonce = random_bytes()?;
+        accounts
+            .register(
+                participant_id,
+                trading.verifying_key(),
+                PoolBalance::new(1, 100),
+            )
+            .map_err(|error| format!("account registration: {error:?}"))?;
         let reserved = reservations
             .reserve(
-                ReservationRecord::new(random_bytes()?, participant_id, 1, 100)
+                ReservationRecord::new(reservation_nonce, epoch_id, participant_id, 1, 100)
                     .map_err(|error| format!("reservation: {error:?}"))?,
                 PoolBalance::new(1, 100),
             )
@@ -494,25 +508,31 @@ pub fn local_proof() -> Result<String, String> {
         let authorization = suspensions
             .issue_authorization(
                 reserved,
-                epoch_id,
                 trading.verifying_key(),
                 &operator_attestation,
                 current_slot + 1_000,
             )
             .map_err(|error| format!("authorization: {error:?}"))?;
-        let body = IntentBodyV1::new(side, 1, 100, epoch_id, participant_id, random_bytes()?)
-            .map_err(|error| error.to_string())?;
-        let signed = SignedIntentV1::sign(body, &trading);
-        let encrypted = dealer
-            .public_keys()
-            .encrypt(&signed)
-            .map_err(|error| format!("encrypt: {error:?}"))?;
-        submissions.push(
-            EncryptedSubmissionV1::sign(authorization, encrypted, random_bytes()?, &trading)
-                .map_err(|error| format!("submission: {error:?}"))?,
-        );
-        signed_intents.push(signed);
+        let prepared = prepare_order(
+            PrepareOrderV1::new(
+                side,
+                100,
+                epoch_id,
+                participant_id,
+                authorization,
+                dealer.public_keys().clone(),
+            )
+            .map_err(|error| format!("prepare order: {error}"))?,
+            &trading,
+            random_bytes()?,
+            random_bytes()?,
+        )
+        .map_err(|error| format!("prepare order: {error}"))?;
+        submissions.push(prepared.submission().clone());
+        signed_intents.push(prepared.signed_intent().clone());
         participant_ids.push(participant_id);
+        reservation_nonces.push(reservation_nonce);
+        trading_keys.push(trading);
     }
     let balances: Vec<_> = participant_ids
         .iter()
@@ -646,7 +666,7 @@ pub fn local_proof() -> Result<String, String> {
 
     let mut recovered = Vec::new();
     let mut evidence = Vec::new();
-    for member_index in 0..4 {
+    for (member_index, expected_intent) in signed_intents.iter().enumerate() {
         let mut releases = Vec::new();
         for (index, directory) in keyper_dirs.iter().enumerate() {
             releases.push(
@@ -670,20 +690,35 @@ pub fn local_proof() -> Result<String, String> {
             }
             output.push_str("REFUSED: one share\n");
         }
-        recovered.push(
-            dealer
-                .public_keys()
-                .recover_submission(
-                    &package.submissions[member_index],
-                    [&releases[0], &releases[1]],
-                )
-                .map_err(|error| format!("recover {member_index}: {error:?}"))?,
-        );
+        let mut quorum_recoveries = Vec::with_capacity(3);
+        for [first, second] in [[0_usize, 1_usize], [0, 2], [1, 2]] {
+            quorum_recoveries.push(
+                dealer
+                    .public_keys()
+                    .recover_submission(
+                        &package.submissions[member_index],
+                        [&releases[first], &releases[second]],
+                    )
+                    .map_err(|error| {
+                        format!("recover {member_index} with shares {first}/{second}: {error:?}")
+                    })?,
+            );
+        }
+        if quorum_recoveries
+            .iter()
+            .any(|intent| intent != expected_intent)
+        {
+            return Err(format!(
+                "two-share recovery path disagreed for member {member_index}"
+            ));
+        }
+        recovered.push(quorum_recoveries.remove(0));
         evidence.push(
             DecryptionEvidenceV1::new(releases.remove(0), releases.remove(0))
                 .map_err(|error| format!("evidence {member_index}: {error:?}"))?,
         );
     }
+    output.push_str("QUORUM: all 3 two-share paths agree\n");
     if recovered != signed_intents {
         return Err("recovered batch differs from submitted intents".to_owned());
     }
@@ -755,7 +790,47 @@ pub fn local_proof() -> Result<String, String> {
             state.terminal_state
         ));
     }
+    let private_before: BTreeMap<_, _> = participant_ids
+        .iter()
+        .map(|participant_id| (*participant_id, PoolBalance::new(1, 100)))
+        .collect();
+    let private_orders = signed_intents
+        .iter()
+        .map(|intent| {
+            FundedOrder::new(
+                intent.body().participant_id(),
+                intent.body().side(),
+                intent.body().limit_price(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("settled order: {error:?}"))?;
+    let batch_config =
+        BatchConfig::new(1, 100).map_err(|error| format!("batch config: {error:?}"))?;
+    let private_result = net_batch(batch_config, &private_before, &private_orders)
+        .map_err(|error| format!("net settled batch: {error:?}"))?;
+    finalize_settlement(
+        &mut accounts,
+        &mut reservations,
+        epoch_id,
+        &private_result,
+        &reservation_nonces,
+    )
+    .map_err(|error| format!("persist settlement result: {error:?}"))?;
+    for ((participant_id, trading_key), expected) in participant_ids
+        .iter()
+        .zip(&trading_keys)
+        .zip(participant_ids.iter().map(|id| private_result.balance(*id)))
+    {
+        let stored = accounts
+            .query_result(*participant_id, trading_key.verifying_key())
+            .map_err(|error| format!("query settlement result: {error:?}"))?;
+        if Some(stored.balance()) != expected || stored.epoch_id() != epoch_id {
+            return Err("persisted participant result differs from the settled batch".to_owned());
+        }
+    }
     output.push_str("SETTLED: one aggregate\n");
+    output.push_str("RESULTS: authenticated balances persisted\n");
     balanced_zero_residual_settlement(
         &rpc,
         &payer,
@@ -776,8 +851,23 @@ pub fn local_proof() -> Result<String, String> {
         ],
     )?;
     output.push_str("BALANCED: zero residual; no venue leg\n");
+    underfilled_epoch_expires_and_releases(
+        &rpc,
+        &validator.rpc_url,
+        &payer,
+        pool,
+        &operator,
+        [
+            pool_base_vault,
+            pool_quote_vault,
+            venue_base_account,
+            venue_quote_account,
+        ],
+    )?;
+    output.push_str("EXPIRED: underfilled; reservations released\n");
     invalid_reveal_aborts_and_suspends(
         &rpc,
+        &validator.rpc_url,
         &payer,
         &executable,
         pool,
@@ -1076,6 +1166,8 @@ pub fn devnet_proof(
         &[&operator],
     )?;
 
+    let mut accounts = AccountJournal::open(run_directory.path().join("accounts.bin"))
+        .map_err(|error| format!("account journal: {error:?}"))?;
     let mut reservations = ReservationJournal::open(run_directory.path().join("reservations.bin"))
         .map_err(|error| format!("reservation journal: {error:?}"))?;
     let suspensions = SuspensionRegistry::open(run_directory.path().join("suspensions.bin"))
@@ -1083,6 +1175,9 @@ pub fn devnet_proof(
     let sides = [Side::Buy, Side::Sell, Side::Buy, Side::Buy];
     let mut submissions = Vec::with_capacity(4);
     let mut participant_ids = Vec::with_capacity(4);
+    let mut reservation_nonces = Vec::with_capacity(4);
+    let mut trading_keys = Vec::with_capacity(4);
+    let mut signed_intents = Vec::with_capacity(4);
     for side in sides {
         let trading = random_signing_key()?;
         let participant_id = random_bytes()?;
@@ -1096,9 +1191,16 @@ pub fn devnet_proof(
             intent_nonce.to_vec(),
             receipt.to_vec(),
         ]);
+        accounts
+            .register(
+                participant_id,
+                trading.verifying_key(),
+                PoolBalance::new(1, 100),
+            )
+            .map_err(|error| format!("account registration: {error:?}"))?;
         let reserved = reservations
             .reserve(
-                ReservationRecord::new(reservation_id, participant_id, 1, 100)
+                ReservationRecord::new(reservation_id, epoch_id, participant_id, 1, 100)
                     .map_err(|error| format!("reservation: {error:?}"))?,
                 PoolBalance::new(1, 100),
             )
@@ -1106,24 +1208,31 @@ pub fn devnet_proof(
         let authorization = suspensions
             .issue_authorization(
                 reserved,
-                epoch_id,
                 trading.verifying_key(),
                 &operator_attestation,
                 authorization_expiry_slot,
             )
             .map_err(|error| format!("authorization: {error:?}"))?;
-        let body = IntentBodyV1::new(side, 1, 100, epoch_id, participant_id, intent_nonce)
-            .map_err(|error| error.to_string())?;
-        let signed = SignedIntentV1::sign(body, &trading);
-        let encrypted = dealer
-            .public_keys()
-            .encrypt(&signed)
-            .map_err(|error| format!("encrypt: {error:?}"))?;
-        submissions.push(
-            EncryptedSubmissionV1::sign(authorization, encrypted, receipt, &trading)
-                .map_err(|error| format!("submission: {error:?}"))?,
-        );
+        let prepared = prepare_order(
+            PrepareOrderV1::new(
+                side,
+                100,
+                epoch_id,
+                participant_id,
+                authorization,
+                dealer.public_keys().clone(),
+            )
+            .map_err(|error| format!("prepare order: {error}"))?,
+            &trading,
+            intent_nonce,
+            receipt,
+        )
+        .map_err(|error| format!("prepare order: {error}"))?;
+        submissions.push(prepared.submission().clone());
+        signed_intents.push(prepared.signed_intent().clone());
         participant_ids.push(participant_id);
+        reservation_nonces.push(reservation_id);
+        trading_keys.push(trading);
     }
     let balances: Vec<_> = participant_ids
         .iter()
@@ -1312,6 +1421,45 @@ pub fn devnet_proof(
     {
         return Err("devnet epoch did not reach the expected settled state".to_owned());
     }
+    let private_before: BTreeMap<_, _> = participant_ids
+        .iter()
+        .map(|participant_id| (*participant_id, PoolBalance::new(1, 100)))
+        .collect();
+    let private_orders = signed_intents
+        .iter()
+        .map(|intent| {
+            FundedOrder::new(
+                intent.body().participant_id(),
+                intent.body().side(),
+                intent.body().limit_price(),
+            )
+            .map_err(|error| format!("settled order: {error:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let private_result = net_batch(
+        BatchConfig::new(1, 100).map_err(|error| format!("batch config: {error:?}"))?,
+        &private_before,
+        &private_orders,
+    )
+    .map_err(|error| format!("settled batch: {error:?}"))?;
+    finalize_settlement(
+        &mut accounts,
+        &mut reservations,
+        epoch_id,
+        &private_result,
+        &reservation_nonces,
+    )
+    .map_err(|error| format!("persist settlement result: {error:?}"))?;
+    for (participant_id, trading_key) in participant_ids.iter().zip(&trading_keys) {
+        let stored = accounts
+            .query_result(*participant_id, trading_key.verifying_key())
+            .map_err(|error| format!("query settlement result: {error:?}"))?;
+        if Some(stored.balance()) != private_result.balance(*participant_id)
+            || stored.epoch_id() != epoch_id
+        {
+            return Err("persisted participant result differs from the settled batch".to_owned());
+        }
+    }
 
     let mut finalized_transactions = Vec::with_capacity(6);
     for signature in funding_signatures
@@ -1405,7 +1553,7 @@ pub fn devnet_proof(
             lock_digest: hex_bytes(lock_digest),
             result: hex_bytes(settlement.result_commitment),
             settlement_digest: hex_bytes(settlement_digest),
-            local_transcript_sha256: transcript_hash,
+            unverified_local_transcript_sha256: transcript_hash,
         },
         token_balances: EvidenceTokenBalancesV1 {
             pool_base_before: token_balances_before[0],
@@ -2167,7 +2315,7 @@ fn balanced_zero_residual_settlement(
         let participant_id = random_bytes()?;
         let reserved = reservations
             .reserve(
-                ReservationRecord::new(random_bytes()?, participant_id, 1, 100)
+                ReservationRecord::new(random_bytes()?, epoch_id, participant_id, 1, 100)
                     .map_err(|error| format!("balanced reservation: {error:?}"))?,
                 PoolBalance::new(1, 100),
             )
@@ -2175,7 +2323,6 @@ fn balanced_zero_residual_settlement(
         let authorization = suspensions
             .issue_authorization(
                 reserved,
-                epoch_id,
                 trading.verifying_key(),
                 operator_attestation,
                 current_slot + 1_000,
@@ -2351,9 +2498,110 @@ fn balanced_zero_residual_settlement(
     Ok(())
 }
 
+fn underfilled_epoch_expires_and_releases(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    payer: &Keypair,
+    pool: Pubkey,
+    operator: &Keypair,
+    backed_accounts: [Pubkey; 4],
+) -> Result<(), String> {
+    let clock_account = rpc
+        .get_account(&solana_program::sysvar::clock::ID)
+        .map_err(|error| format!("read expiry clock: {error}"))?;
+    let clock: Clock = bincode::deserialize(&clock_account.data)
+        .map_err(|error| format!("decode expiry clock: {error}"))?;
+    let epoch_id = random_bytes()?;
+    let (epoch, _) = epoch_address(&pool, &epoch_id);
+    let lock_deadline = clock.unix_timestamp + 2;
+    send(
+        rpc,
+        payer,
+        &[create_epoch_instruction(
+            payer.pubkey(),
+            operator.pubkey(),
+            pool,
+            epoch,
+            CreateEpochArgs {
+                epoch_id,
+                minimum_count: 4,
+                quote_atoms_per_lot: 100,
+                lock_deadline,
+                abort_deadline: lock_deadline + 30,
+            },
+        )],
+        &[operator],
+    )?;
+
+    let private = tempfile::tempdir().map_err(|error| format!("expiry state: {error}"))?;
+    let mut accounts = AccountJournal::open(private.path().join("accounts.bin"))
+        .map_err(|error| format!("expiry account journal: {error:?}"))?;
+    let mut reservations = ReservationJournal::open(private.path().join("reservations.bin"))
+        .map_err(|error| format!("expiry reservation journal: {error:?}"))?;
+    let mut nonces = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let nonce = random_bytes()?;
+        reservations
+            .reserve(
+                ReservationRecord::new(nonce, epoch_id, random_bytes()?, 1, 100)
+                    .map_err(|error| format!("expiry reservation: {error:?}"))?,
+                PoolBalance::new(1, 100),
+            )
+            .map_err(|error| format!("expiry reservation: {error:?}"))?;
+        nonces.push(nonce);
+    }
+    let before = backed_accounts
+        .map(|account| token_amount(rpc, &account))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    loop {
+        let account = rpc
+            .get_account(&solana_program::sysvar::clock::ID)
+            .map_err(|error| format!("read expiry clock: {error}"))?;
+        let current: Clock = bincode::deserialize(&account.data)
+            .map_err(|error| format!("decode expiry clock: {error}"))?;
+        if current.unix_timestamp > lock_deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    send(
+        rpc,
+        payer,
+        &[expire_instruction(operator.pubkey(), pool, epoch)],
+        &[operator],
+    )?;
+    let state = EpochStateV1::decode(
+        &rpc.get_account(&epoch)
+            .map_err(|error| format!("read expired epoch: {error}"))?
+            .data,
+    )
+    .map_err(|error| format!("decode expired epoch: {error}"))?;
+    let after = backed_accounts
+        .map(|account| token_amount(rpc, &account))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    if state.terminal_state != EpochTerminalState::Expired || before != after {
+        return Err("underfilled expiry changed backed token balances".to_owned());
+    }
+    let terminal_epoch = ProgramClient::new(rpc_url)
+        .fetch_confirmed_terminal_epoch(epoch)
+        .map_err(|error| format!("confirm expired epoch: {error:?}"))?;
+    release_reservations(&mut accounts, &mut reservations, &terminal_epoch, &nonces)
+        .map_err(|error| format!("release expired reservations: {error:?}"))?;
+    if nonces
+        .iter()
+        .any(|nonce| reservations.state(*nonce) != Some(ReservationState::Released))
+    {
+        return Err("expired epoch left a private reservation active".to_owned());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn invalid_reveal_aborts_and_suspends(
     rpc: &RpcClient,
+    rpc_url: &str,
     payer: &Keypair,
     executable: &Path,
     pool: Pubkey,
@@ -2394,12 +2642,15 @@ fn invalid_reveal_aborts_and_suspends(
 
     let dealer = EpochDealer::random().map_err(|error| format!("invalid dealer: {error:?}"))?;
     let private = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let mut accounts = AccountJournal::open(private.path().join("accounts.bin"))
+        .map_err(|error| format!("invalid account journal: {error:?}"))?;
     let mut reservations = ReservationJournal::open(private.path().join("reservations.bin"))
         .map_err(|error| format!("invalid reservation journal: {error:?}"))?;
     let mut suspensions = SuspensionRegistry::open(private.path().join("suspensions.bin"))
         .map_err(|error| format!("invalid suspension registry: {error:?}"))?;
     let mut submissions = Vec::new();
     let mut balance_records = Vec::new();
+    let mut reservation_nonces = Vec::new();
     let current_slot = rpc.get_slot().map_err(|error| error.to_string())?;
     let mut malformed_trading = None;
     let mut malformed_participant = None;
@@ -2410,17 +2661,18 @@ fn invalid_reveal_aborts_and_suspends(
             malformed_trading = Some(trading.clone());
             malformed_participant = Some(participant_id);
         }
+        let reservation_nonce = random_bytes()?;
         let reserved = reservations
             .reserve(
-                ReservationRecord::new(random_bytes()?, participant_id, 1, 100)
+                ReservationRecord::new(reservation_nonce, epoch_id, participant_id, 1, 100)
                     .map_err(|error| format!("invalid reservation: {error:?}"))?,
                 PoolBalance::new(1, 100),
             )
             .map_err(|error| format!("invalid reservation: {error:?}"))?;
+        reservation_nonces.push(reservation_nonce);
         let authorization = suspensions
             .issue_authorization(
                 reserved,
-                epoch_id,
                 trading.verifying_key(),
                 operator_attestation,
                 current_slot + 1_000,
@@ -2572,6 +2824,22 @@ fn invalid_reveal_aborts_and_suspends(
     if state.terminal_state != EpochTerminalState::Aborted || before != after {
         return Err("invalid reveal abort changed backed token balances".to_owned());
     }
+    let terminal_epoch = ProgramClient::new(rpc_url)
+        .fetch_confirmed_terminal_epoch(epoch)
+        .map_err(|error| format!("confirm aborted epoch: {error:?}"))?;
+    release_reservations(
+        &mut accounts,
+        &mut reservations,
+        &terminal_epoch,
+        &reservation_nonces,
+    )
+    .map_err(|error| format!("release aborted reservations: {error:?}"))?;
+    if reservation_nonces
+        .iter()
+        .any(|nonce| reservations.state(*nonce) != Some(ReservationState::Released))
+    {
+        return Err("aborted epoch left a private reservation active".to_owned());
+    }
     let malformed_trading = malformed_trading.ok_or("malformed trading key missing")?;
     let malformed_trading_key = malformed_trading.verifying_key().to_bytes();
     suspensions
@@ -2583,16 +2851,16 @@ fn invalid_reveal_aborts_and_suspends(
     if !reopened.is_suspended(malformed_trading_key) {
         return Err("invalid revealer trading key was not durably suspended".to_owned());
     }
+    let later_epoch_id = random_bytes()?;
     let later = reservations
         .reserve(
-            ReservationRecord::new(random_bytes()?, random_bytes()?, 1, 100)
+            ReservationRecord::new(random_bytes()?, later_epoch_id, random_bytes()?, 1, 100)
                 .map_err(|error| format!("later reservation: {error:?}"))?,
             PoolBalance::new(1, 100),
         )
         .map_err(|error| format!("later reservation: {error:?}"))?;
     if reopened.issue_authorization(
         later,
-        random_bytes()?,
         malformed_trading.verifying_key(),
         operator_attestation,
         current_slot + 2_000,

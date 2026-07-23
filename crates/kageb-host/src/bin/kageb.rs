@@ -1,8 +1,9 @@
 use std::{env, path::Path, process::ExitCode};
 
 const DEFAULT_DEVNET_RPC: &str = "https://api.devnet.solana.com";
-const USAGE: &str =
-    "usage: kageb client prepare --keypair <path> | kageb trace | kageb demo local | \
+const USAGE: &str = "usage: kageb client account --state <path> --keypair <path> | \
+kageb client epoch | kageb client prepare --keypair <path> | \
+kageb client result --state <path> --keypair <path> | kageb trace | kageb demo local | \
 kageb demo devnet --payer <path> --program <id> --out <path> \
 [--checkpoint-artifact <path>] [--rpc <url>] | \
 kageb verify evidence <path> [--checkpoint-artifact <path>] [--rpc <url>]";
@@ -36,12 +37,46 @@ The authorization epoch, participant, and trading key must match the request and
 The coordinator remains authoritative for admission.
 The keypair must be an exact regular non-symlink Solana JSON key file with Unix mode 0600.
 "#;
+const CLIENT_ACCOUNT_HELP: &str = r#"usage: kageb client account --state <path> --keypair <path>
+
+Reads JSON schema v1 from stdin:
+{"schema_version":1,"participant_id":"<base58 32 bytes>","base_atoms":<nonzero u64>,"quote_atoms":<nonzero u64>}
+
+Returns JSON schema v1 with participant_id, trading_key, base_atoms, and quote_atoms.
+The keypair must be an exact regular non-symlink Solana JSON key file with Unix mode 0600.
+"#;
+const CLIENT_EPOCH_HELP: &str = r#"usage: kageb client epoch
+
+Reads and validates one coordinator epoch JSON object from stdin, then returns the same schema_version 1:
+epoch_id, base_mint, quote_mint, base_lot_atoms, quote_atoms_per_lot, minimum_count,
+keyper_threshold, lock_deadline, abort_deadline, and epoch_public_keys_base64.
+"#;
+const CLIENT_RESULT_HELP: &str = r#"usage: kageb client result --state <path> --keypair <path>
+
+Reads JSON schema v1 from stdin:
+{"schema_version":1,"participant_id":"<base58 32 bytes>"}
+
+Returns JSON schema v1 with participant_id, epoch_id, base_atoms, and quote_atoms.
+Only the trading key registered for the participant can read the result.
+"#;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     match arguments.as_slice() {
+        [group, command, help] if group == "client" && command == "account" && help == "--help" => {
+            print!("{CLIENT_ACCOUNT_HELP}");
+            ExitCode::SUCCESS
+        }
+        [group, command, help] if group == "client" && command == "epoch" && help == "--help" => {
+            print!("{CLIENT_EPOCH_HELP}");
+            ExitCode::SUCCESS
+        }
         [group, command, help] if group == "client" && command == "prepare" && help == "--help" => {
             print!("{CLIENT_PREPARE_HELP}");
+            ExitCode::SUCCESS
+        }
+        [group, command, help] if group == "client" && command == "result" && help == "--help" => {
+            print!("{CLIENT_RESULT_HELP}");
             ExitCode::SUCCESS
         }
         [group, command, keypair_flag, keypair]
@@ -51,6 +86,43 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("client prepare rejected: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        [group, command] if group == "client" && command == "epoch" => {
+            match kageb::handle_client_epoch() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("client epoch rejected: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        [group, command, state_flag, state, keypair_flag, keypair]
+            if group == "client"
+                && command == "account"
+                && state_flag == "--state"
+                && keypair_flag == "--keypair" =>
+        {
+            match kageb::handle_client_account(Path::new(state), Path::new(keypair)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("client account rejected: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        [group, command, state_flag, state, keypair_flag, keypair]
+            if group == "client"
+                && command == "result"
+                && state_flag == "--state"
+                && keypair_flag == "--keypair" =>
+        {
+            match kageb::handle_client_result(Path::new(state), Path::new(keypair)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("client result rejected: {error}");
                     ExitCode::FAILURE
                 }
             }

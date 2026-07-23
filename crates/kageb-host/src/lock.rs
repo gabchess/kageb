@@ -795,6 +795,36 @@ impl ConfirmedOpenEpoch {
     }
 }
 
+/// A capability produced only by a confirmed read of one program-owned aborted or expired epoch.
+pub struct ConfirmedTerminalEpoch {
+    pub(crate) epoch_account: Pubkey,
+    pub(crate) epoch_id: [u8; 32],
+    pub(crate) terminal_state: EpochTerminalState,
+    pub(crate) confirmation_slot: u64,
+}
+
+impl ConfirmedTerminalEpoch {
+    #[must_use]
+    pub const fn epoch_account(&self) -> Pubkey {
+        self.epoch_account
+    }
+
+    #[must_use]
+    pub const fn epoch_id(&self) -> [u8; 32] {
+        self.epoch_id
+    }
+
+    #[must_use]
+    pub const fn terminal_state(&self) -> EpochTerminalState {
+        self.terminal_state
+    }
+
+    #[must_use]
+    pub const fn confirmation_slot(&self) -> u64 {
+        self.confirmation_slot
+    }
+}
+
 #[derive(Debug)]
 pub struct LockJournal {
     path: PathBuf,
@@ -845,7 +875,7 @@ impl LockJournal {
     }
 }
 
-/// A lock capability that can only be produced by fetching a confirmed program account.
+/// A live lock capability produced by one confirmed epoch, pool, and clock read.
 pub struct ConfirmedLock {
     pub(crate) epoch_account: Pubkey,
     pub(crate) state: EpochStateV1,
@@ -905,11 +935,11 @@ impl ProgramClient {
         let response = self
             .rpc
             .get_multiple_accounts_with_commitment(
-                &[epoch_account, initial_lock.state.pool],
+                &[epoch_account, initial_lock.state.pool, sysvar::clock::ID],
                 CommitmentConfig::confirmed(),
             )
             .map_err(|_| LockValidationError::Rpc)?;
-        if response.context.slot < initial_lock.confirmation_slot || response.value.len() != 2 {
+        if response.context.slot < initial_lock.confirmation_slot || response.value.len() != 3 {
             return Err(LockValidationError::Rpc);
         }
         let mut accounts = response.value.into_iter();
@@ -921,10 +951,15 @@ impl ProgramClient {
             .next()
             .flatten()
             .ok_or(LockValidationError::MissingAccount)?;
+        let clock = accounts
+            .next()
+            .flatten()
+            .ok_or(LockValidationError::MissingAccount)?;
         confirmed_lock_from_accounts(
             epoch_account,
             RpcAccountData::new(epoch.owner, &epoch.data),
             RpcAccountData::new(pool.owner, &pool.data),
+            RpcAccountData::new(clock.owner, &clock.data),
             response.context.slot,
         )
     }
@@ -969,6 +1004,23 @@ impl ProgramClient {
             initial_state.pool,
             RpcAccountData::new(pool.owner, &pool.data),
             RpcAccountData::new(clock.owner, &clock.data),
+            response.context.slot,
+        )
+    }
+
+    pub fn fetch_confirmed_terminal_epoch(
+        &self,
+        epoch_account: Pubkey,
+    ) -> Result<ConfirmedTerminalEpoch, LockValidationError> {
+        let response = self
+            .rpc
+            .get_account_with_commitment(&epoch_account, CommitmentConfig::confirmed())
+            .map_err(|_| LockValidationError::Rpc)?;
+        let account = response.value.ok_or(LockValidationError::MissingAccount)?;
+        confirmed_terminal_epoch_from_account(
+            epoch_account,
+            account.owner,
+            &account.data,
             response.context.slot,
         )
     }
@@ -1093,6 +1145,27 @@ fn decode_program_epoch(
     Ok(state)
 }
 
+fn confirmed_terminal_epoch_from_account(
+    epoch_account: Pubkey,
+    owner: Pubkey,
+    data: &[u8],
+    confirmation_slot: u64,
+) -> Result<ConfirmedTerminalEpoch, LockValidationError> {
+    let state = decode_program_epoch(epoch_account, owner, data)?;
+    if !matches!(
+        state.terminal_state,
+        EpochTerminalState::Expired | EpochTerminalState::Aborted
+    ) {
+        return Err(LockValidationError::InvalidOnchainEpoch);
+    }
+    Ok(ConfirmedTerminalEpoch {
+        epoch_account,
+        epoch_id: state.epoch_id,
+        terminal_state: state.terminal_state,
+        confirmation_slot,
+    })
+}
+
 fn confirmed_lock_from_account(
     epoch_account: Pubkey,
     owner: Pubkey,
@@ -1142,6 +1215,7 @@ fn confirmed_lock_from_accounts(
     epoch_account: Pubkey,
     epoch_account_data: RpcAccountData<'_>,
     pool_account_data: RpcAccountData<'_>,
+    clock_account_data: RpcAccountData<'_>,
     confirmation_slot: u64,
 ) -> Result<ConfirmedLock, LockValidationError> {
     let mut confirmed = confirmed_lock_from_account(
@@ -1150,7 +1224,7 @@ fn confirmed_lock_from_accounts(
         epoch_account_data.data,
         confirmation_slot,
     )?;
-    if pool_account_data.owner != ID {
+    if pool_account_data.owner != ID || clock_account_data.owner != sysvar::ID {
         return Err(LockValidationError::InvalidOnchainLock);
     }
     let pool = PoolStateV1::decode(pool_account_data.data)
@@ -1158,6 +1232,8 @@ fn confirmed_lock_from_accounts(
     let (expected_pool, pool_bump) =
         pool_address(&pool.operator, &pool.base_mint, &pool.quote_mint);
     let (_, vault_bump) = vault_authority_address(&confirmed.state.pool);
+    let clock: Clock = bincode::deserialize(clock_account_data.data)
+        .map_err(|_| LockValidationError::InvalidOnchainLock)?;
     let configuration = EpochConfigurationV1 {
         pool: confirmed.state.pool,
         epoch_id: confirmed.state.epoch_id,
@@ -1180,6 +1256,8 @@ fn confirmed_lock_from_accounts(
         || pool.base_lot_atoms == 0
         || pool.base_mint == pool.quote_mint
         || configuration.digest() != confirmed.state.configuration_hash
+        || clock.slot > confirmation_slot
+        || clock.unix_timestamp > confirmed.state.abort_deadline
     {
         return Err(LockValidationError::InvalidOnchainLock);
     }
@@ -1441,6 +1519,41 @@ mod tests {
         assert!(confirmed_lock_from_account(epoch, ID, &invalid.encode(), 42).is_err());
 
         assert!(confirmed_lock_from_account(epoch, ID, &state.encode()[..383], 42).is_err());
+    }
+
+    #[test]
+    fn terminal_capability_requires_a_program_owned_epoch_pda_and_abort_or_expiry() {
+        let (epoch, mut state) = locked_state();
+        state.terminal_state = EpochTerminalState::Expired;
+        let confirmed =
+            confirmed_terminal_epoch_from_account(epoch, ID, &state.encode(), 43).unwrap();
+        assert_eq!(confirmed.epoch_account(), epoch);
+        assert_eq!(confirmed.epoch_id(), state.epoch_id);
+        assert_eq!(confirmed.terminal_state(), EpochTerminalState::Expired);
+        assert_eq!(confirmed.confirmation_slot(), 43);
+
+        state.terminal_state = EpochTerminalState::Aborted;
+        assert!(confirmed_terminal_epoch_from_account(epoch, ID, &state.encode(), 44).is_ok());
+
+        state.terminal_state = EpochTerminalState::Open;
+        assert!(confirmed_terminal_epoch_from_account(epoch, ID, &state.encode(), 45).is_err());
+        state.terminal_state = EpochTerminalState::Settled;
+        assert!(confirmed_terminal_epoch_from_account(epoch, ID, &state.encode(), 46).is_err());
+        state.terminal_state = EpochTerminalState::Expired;
+        assert!(confirmed_terminal_epoch_from_account(
+            epoch,
+            Pubkey::new_unique(),
+            &state.encode(),
+            47,
+        )
+        .is_err());
+        assert!(confirmed_terminal_epoch_from_account(
+            Pubkey::new_unique(),
+            ID,
+            &state.encode(),
+            48,
+        )
+        .is_err());
     }
 
     #[test]

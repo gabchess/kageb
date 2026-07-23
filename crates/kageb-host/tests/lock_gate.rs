@@ -70,13 +70,13 @@ fn submission_with_intent(
     let mut reservations = ReservationJournal::open(directory.path().join("r.bin")).unwrap();
     let reserved = reservations
         .reserve(
-            ReservationRecord::new([id; 32], [id; 32], 1, 100).unwrap(),
+            ReservationRecord::new([id; 32], epoch_id, [id; 32], 1, 100).unwrap(),
             PoolBalance::new(1, 100),
         )
         .unwrap();
     let authorization = SuspensionRegistry::open(directory.path().join("suspensions.bin"))
         .unwrap()
-        .issue_authorization(reserved, epoch_id, trader.verifying_key(), operator, 1_000)
+        .issue_authorization(reserved, trader.verifying_key(), operator, 1_000)
         .unwrap();
     let body = IntentBodyV1::new(Side::Buy, 1, 100, epoch_id, [id; 32], [id; 16]).unwrap();
     let signed = SignedIntentV1::sign(body, &trader);
@@ -1123,6 +1123,21 @@ fn confirmed_open_epoch_rejects_the_exact_lock_deadline() {
     );
     assert!(ProgramClient::new(&rpc.url)
         .fetch_confirmed_open_epoch(package.epoch_account())
+        .is_err());
+}
+
+#[test]
+fn confirmed_locked_epoch_rejects_after_abort_deadline() {
+    let _serial = serial_rpc_test();
+    let (package, operator, _attesters, _dealer, _intents) = valid_package();
+    let rpc = MockRpc::start_with(
+        &package,
+        &operator,
+        package.configuration.abort_deadline + 1,
+        true,
+    );
+    assert!(ProgramClient::new(&rpc.url)
+        .fetch_confirmed_lock(package.epoch_account())
         .is_err());
 }
 

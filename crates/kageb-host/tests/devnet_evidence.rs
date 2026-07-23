@@ -90,7 +90,7 @@ fn content() -> DevnetEvidenceContentV1 {
             lock_digest: digest(5),
             result: digest(6),
             settlement_digest: digest(7),
-            local_transcript_sha256: digest(8),
+            unverified_local_transcript_sha256: digest(8),
         },
         token_balances: EvidenceTokenBalancesV1 {
             pool_base_before: 4,

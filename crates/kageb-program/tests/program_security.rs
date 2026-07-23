@@ -360,6 +360,35 @@ async fn settle_net_buy_moves_exact_checked_token_legs_and_marks_the_epoch() {
 }
 
 #[tokio::test]
+async fn settlement_after_abort_deadline_leaves_tokens_and_lock_unchanged() {
+    let mut fixture = Fixture::start().await;
+    fixture.initialize().await;
+    set_token_amount(&mut fixture.context, fixture.pool_base_vault, 10).await;
+    set_token_amount(&mut fixture.context, fixture.pool_quote_vault, 1_000).await;
+    set_token_amount(&mut fixture.context, fixture.venue_base_account, 10).await;
+    set_token_amount(&mut fixture.context, fixture.venue_quote_account, 0).await;
+    let mut clock = fixture
+        .context
+        .banks_client
+        .get_sysvar::<Clock>()
+        .await
+        .unwrap();
+    let lock_deadline = clock.unix_timestamp + 100;
+    let abort_deadline = clock.unix_timestamp + 200;
+    let (epoch, lock) = fixture
+        .lock_epoch([59; 32], lock_deadline, abort_deadline)
+        .await;
+    clock.unix_timestamp = abort_deadline + 1;
+    fixture.context.set_sysvar(&clock);
+
+    let payload = fixture.settlement_payload(epoch, lock, 1, 2);
+    assert!(settle_with(&mut fixture, epoch, payload, [0, 1])
+        .await
+        .is_err());
+    assert_locked_unchanged(&mut fixture, epoch, [10, 1_000, 10, 0]).await;
+}
+
+#[tokio::test]
 async fn settle_net_sell_and_zero_residual_have_exact_token_effects() {
     let mut sell = Fixture::start().await;
     sell.initialize().await;

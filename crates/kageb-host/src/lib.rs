@@ -1,5 +1,6 @@
 //! Host-side KageB protocol types.
 
+mod account;
 mod admission;
 mod client;
 mod commitment;
@@ -12,11 +13,17 @@ mod ledger;
 mod lock;
 mod observer;
 
+pub use account::{
+    finalize_settlement, release_reservations, AccountError, AccountJournal, AccountResultV1,
+};
 pub use admission::{
     JournalError, ReservationJournal, ReservationRecord, ReservationState, SubmissionV1,
     SuspensionError, SuspensionRegistry, UnsignedFundedAuthorizationV1,
 };
-pub use client::{handle_client_prepare, ClientPrepareError};
+pub use client::{
+    handle_client_account, handle_client_epoch, handle_client_prepare, handle_client_result,
+    prepare_order, ClientPrepareError, PrepareOrderV1, PreparedOrderV1,
+};
 pub use commitment::{content_root, CommitmentDomain, CommitmentError};
 pub use crypto::{
     admit_batch, AdmissionPolicyV1, AdmittedBatch, CryptoError, EncryptedIntentV1,
@@ -47,9 +54,9 @@ pub use ledger::{
     VaultDelta,
 };
 pub use lock::{
-    BalanceRecordV1, ConfirmedLock, ConfirmedOpenEpoch, LockApprovalV1, LockJournal, LockPackageV1,
-    LockValidationError, ProgramClient, ReferenceKeyper, SignedBalanceSnapshotV1,
-    MAX_BATCH_MEMBERS,
+    BalanceRecordV1, ConfirmedLock, ConfirmedOpenEpoch, ConfirmedTerminalEpoch, LockApprovalV1,
+    LockJournal, LockPackageV1, LockValidationError, ProgramClient, ReferenceKeyper,
+    SignedBalanceSnapshotV1, MAX_BATCH_MEMBERS,
 };
 pub use observer::{
     DirectMarketAccounts, DirectOrder, KagebObserverAccounts, ObserverError, PublicTrace,

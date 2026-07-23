@@ -8,17 +8,17 @@ use kageb::{
 use tempfile::tempdir;
 
 fn record(nonce: u8) -> ReservationRecord {
-    ReservationRecord::new([nonce; 32], [7; 32], 2, 100).expect("funded reservation")
+    ReservationRecord::new([nonce; 32], [42; 32], [7; 32], 2, 100).expect("funded reservation")
 }
 
 #[test]
 fn reservation_requires_both_sides_funded() {
     assert_eq!(
-        ReservationRecord::new([1; 32], [7; 32], 0, 100),
+        ReservationRecord::new([1; 32], [42; 32], [7; 32], 0, 100),
         Err(JournalError::InvalidAmount)
     );
     assert_eq!(
-        ReservationRecord::new([1; 32], [7; 32], 2, 0),
+        ReservationRecord::new([1; 32], [42; 32], [7; 32], 2, 0),
         Err(JournalError::InvalidAmount)
     );
 }
@@ -224,7 +224,7 @@ fn suspended_trading_key_survives_restart_and_blocks_later_authorization() {
         .expect("first reservation");
     let mut suspensions = SuspensionRegistry::open(&suspension_path).expect("registry");
     assert!(suspensions
-        .issue_authorization(first, [42; 32], trading_key, &operator, 1_000)
+        .issue_authorization(first, trading_key, &operator, 1_000)
         .is_ok());
 
     suspensions
@@ -237,7 +237,7 @@ fn suspended_trading_key_survives_restart_and_blocks_later_authorization() {
         .reserve(record(2), PoolBalance::new(10, 1_000))
         .expect("later reservation");
     assert_eq!(
-        reopened.issue_authorization(later, [43; 32], trading_key, &operator, 2_000),
+        reopened.issue_authorization(later, trading_key, &operator, 2_000),
         Err(SuspensionError::Suspended)
     );
 }

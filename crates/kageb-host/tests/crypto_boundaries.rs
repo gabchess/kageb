@@ -57,6 +57,7 @@ fn authorization_with(
         .reserve(
             ReservationRecord::new(
                 [member.nonce; 32],
+                epoch,
                 [member.participant; 32],
                 member.base_atoms,
                 member.quote_atoms,
@@ -67,13 +68,7 @@ fn authorization_with(
         .expect("reserve");
     SuspensionRegistry::open(directory.path().join("suspensions.bin"))
         .expect("suspensions")
-        .issue_authorization(
-            reserved,
-            epoch,
-            trading.verifying_key(),
-            operator,
-            member.expiry,
-        )
+        .issue_authorization(reserved, trading.verifying_key(), operator, member.expiry)
         .expect("authorization")
 }
 

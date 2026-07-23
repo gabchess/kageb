@@ -397,7 +397,7 @@ fn settle(
     {
         return Err(KagebError::InvalidAccounts.into());
     }
-    let _clock = solana_program::clock::Clock::from_account_info(clock_account)?;
+    let clock = solana_program::clock::Clock::from_account_info(clock_account)?;
 
     let pool_state = PoolStateV1::decode(&pool.try_borrow_data()?)?;
     validate_pool_state(pool, &pool_state)?;
@@ -405,6 +405,9 @@ fn settle(
     validate_epoch_state(epoch, &epoch_state, pool, &pool_state)?;
     if epoch_state.terminal_state != EpochTerminalState::Locked {
         return Err(KagebError::InvalidState.into());
+    }
+    if clock.unix_timestamp > epoch_state.abort_deadline {
+        return Err(KagebError::DeadlinePassed.into());
     }
     let (expected_vault_authority, canonical_vault_bump) = vault_authority_address(pool.key);
     if expected_vault_authority != *vault_authority.key

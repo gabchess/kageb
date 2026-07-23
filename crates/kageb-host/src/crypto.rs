@@ -112,12 +112,11 @@ impl FundedAuthorizationV1 {
     #[must_use]
     pub(crate) fn sign(
         reserved: UnsignedFundedAuthorizationV1,
-        epoch_id: [u8; 32],
         trading_key: VerifyingKey,
         operator: &SigningKey,
         expiry_slot: u64,
     ) -> Self {
-        let (nonce, participant_id, base_atoms, quote_atoms) = reserved.into_parts();
+        let (nonce, epoch_id, participant_id, base_atoms, quote_atoms) = reserved.into_parts();
         let trading_key = trading_key.to_bytes();
         let operator_key = operator.verifying_key().to_bytes();
         let unsigned = authorization_bytes(

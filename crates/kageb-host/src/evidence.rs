@@ -153,7 +153,7 @@ pub struct EvidenceCommitmentsV1 {
     pub lock_digest: String,
     pub result: String,
     pub settlement_digest: String,
-    pub local_transcript_sha256: String,
+    pub unverified_local_transcript_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -638,7 +638,7 @@ fn validate_program_state(
     {
         return Err(DevnetEvidenceError::ChangedCommitment);
     }
-    parse_digest(&evidence.commitments.local_transcript_sha256)?;
+    parse_digest(&evidence.commitments.unverified_local_transcript_sha256)?;
     Ok((pool, epoch))
 }
 

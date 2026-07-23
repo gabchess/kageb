@@ -94,6 +94,7 @@ impl VaultDelta {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchResult {
+    before_balances: BTreeMap<ParticipantId, PoolBalance>,
     balances: BTreeMap<ParticipantId, PoolBalance>,
     residual: Residual,
     vault_delta: VaultDelta,
@@ -117,6 +118,10 @@ impl BatchResult {
 
     pub(crate) const fn balances(&self) -> &BTreeMap<ParticipantId, PoolBalance> {
         &self.balances
+    }
+
+    pub(crate) const fn before_balances(&self) -> &BTreeMap<ParticipantId, PoolBalance> {
+        &self.before_balances
     }
 
     #[must_use]
@@ -232,6 +237,7 @@ pub fn net_batch(
         .ok_or(LedgerError::ArithmeticOverflow)?;
 
     let result = BatchResult {
+        before_balances: before.clone(),
         balances,
         residual,
         vault_delta: VaultDelta {

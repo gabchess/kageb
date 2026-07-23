@@ -3,13 +3,15 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::SigningKey;
 use kageb::{
-    AdmissionPolicyV1, EncryptedSubmissionV1, EpochDealer, EpochPublicKeys, PoolBalance,
-    ReservationJournal, ReservationRecord, SuspensionRegistry,
+    finalize_settlement, net_batch, prepare_order, AccountJournal, AdmissionPolicyV1, BatchConfig,
+    EncryptedSubmissionV1, EpochDealer, EpochPublicKeys, FundedAuthorizationV1, FundedOrder,
+    PoolBalance, PrepareOrderV1, ReservationJournal, ReservationRecord, Side, SuspensionRegistry,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,7 +58,7 @@ fn fixture() -> Fixture {
         ReservationJournal::open(directory.path().join("reservations.bin")).expect("journal");
     let reserved = journal
         .reserve(
-            ReservationRecord::new([8; 32], participant_id, 2, 100).expect("record"),
+            ReservationRecord::new([8; 32], epoch_id, participant_id, 2, 100).expect("record"),
             PoolBalance::new(2, 100),
         )
         .expect("reservation");
@@ -64,7 +66,6 @@ fn fixture() -> Fixture {
         .expect("registry")
         .issue_authorization(
             reserved,
-            epoch_id,
             SigningKey::from_bytes(&[7; 32]).verifying_key(),
             &operator,
             1_000,
@@ -130,6 +131,23 @@ fn run_client(keypair_path: &Path, request: &[u8]) -> Output {
     child.wait_with_output().expect("client output")
 }
 
+fn run_client_command(arguments: &[&str], request: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kageb"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn client command");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(request)
+        .expect("write request");
+    child.wait_with_output().expect("client command output")
+}
+
 #[test]
 fn client_prepare_help_publishes_the_exact_no_secret_schema() {
     let output = Command::new(env!("CARGO_BIN_EXE_kageb"))
@@ -156,6 +174,43 @@ fn client_prepare_help_publishes_the_exact_no_secret_schema() {
     }
     assert!(help.contains("maximum 16384 bytes"));
     assert!(!help.contains("DO_NOT_ECHO_MARKER"));
+}
+
+#[test]
+fn every_bot_command_publishes_its_json_contract() {
+    for (command, fields) in [
+        (
+            "account",
+            &["participant_id", "base_atoms", "quote_atoms", "trading_key"][..],
+        ),
+        (
+            "epoch",
+            &[
+                "epoch_id",
+                "minimum_count",
+                "keyper_threshold",
+                "lock_deadline",
+                "abort_deadline",
+                "epoch_public_keys_base64",
+            ][..],
+        ),
+        (
+            "result",
+            &["participant_id", "epoch_id", "base_atoms", "quote_atoms"][..],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kageb"))
+            .args(["client", command, "--help"])
+            .output()
+            .expect("client help");
+        assert!(output.status.success(), "{command} help failed");
+        assert!(output.stderr.is_empty(), "{command} help wrote stderr");
+        let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+        assert!(help.contains("schema_version"));
+        for field in fields {
+            assert!(help.contains(field), "{command} help omitted {field}");
+        }
+    }
 }
 
 #[test]
@@ -206,6 +261,47 @@ fn client_prepares_roundtrippable_admissible_submission() {
         response.submission_sha256_base64,
         BASE64.encode(Sha256::digest(&wire))
     );
+}
+
+#[test]
+fn typed_order_contract_builds_the_same_admissible_submission_used_by_bots() {
+    let fixture = fixture();
+    let authorization = FundedAuthorizationV1::decode(
+        &BASE64
+            .decode(
+                fixture.request["funded_authorization_base64"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let public_keys = EpochPublicKeys::decode_wire(&fixture.epoch_public_keys_wire).unwrap();
+    let trading_key = SigningKey::from_bytes(&[7; 32]);
+    let prepared = prepare_order(
+        PrepareOrderV1::new(
+            Side::Buy,
+            100,
+            fixture.epoch_id,
+            fixture.participant_id,
+            authorization,
+            public_keys,
+        )
+        .unwrap(),
+        &trading_key,
+        [33; 16],
+        [34; 32],
+    )
+    .unwrap();
+    assert!(prepared
+        .submission()
+        .verify_admission(&fixture.policy)
+        .is_ok());
+    let recovered = EpochPublicKeys::decode_wire(&fixture.epoch_public_keys_wire).unwrap();
+    assert_eq!(prepared.signed_intent().body().side(), Side::Buy);
+    assert!(recovered
+        .recover_submission(prepared.submission(), [])
+        .is_err());
 }
 
 #[test]
@@ -358,4 +454,163 @@ fn client_diagnostics_do_not_echo_request_path_or_secret() {
     assert!(!stdout.contains(&bs58::encode([7; 32]).into_string()));
     assert!(!stdout.contains(&BASE64.encode([7; 32])));
     assert!(!stdout.contains(&serde_json::to_string(&vec![7; 32]).expect("secret JSON")));
+}
+
+#[test]
+fn bot_account_and_result_commands_persist_one_authenticated_settlement() {
+    let directory = tempdir().expect("tempdir");
+    let state_path = directory.path().join("accounts.bin");
+    let keypair_path = directory.path().join("trading-keypair.json");
+    let trader = Keypair::new_from_array([7; 32]);
+    write_keypair(&keypair_path, &trader, 0o600);
+    let participant_id = [17; 32];
+    let register = json!({
+        "schema_version": 1,
+        "participant_id": bs58::encode(participant_id).into_string(),
+        "base_atoms": 1,
+        "quote_atoms": 100,
+    });
+    let output = run_client_command(
+        &[
+            "client",
+            "account",
+            "--state",
+            state_path.to_str().unwrap(),
+            "--keypair",
+            keypair_path.to_str().unwrap(),
+        ],
+        &serde_json::to_vec(&register).unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "account failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(registered["schema_version"], 1);
+    assert_eq!(registered["participant_id"], register["participant_id"]);
+    assert_eq!(registered["base_atoms"], 1);
+    assert_eq!(registered["quote_atoms"], 100);
+    assert_eq!(
+        registered["trading_key"],
+        bs58::encode(&trader.to_bytes()[32..]).into_string()
+    );
+
+    let before = std::collections::BTreeMap::from([(participant_id, PoolBalance::new(1, 100))]);
+    let result = net_batch(
+        BatchConfig::new(1, 100).unwrap(),
+        &before,
+        &[FundedOrder::new(participant_id, Side::Buy, 100).unwrap()],
+    )
+    .unwrap();
+    let mut accounts = AccountJournal::open(&state_path).unwrap();
+    let mut reservations =
+        ReservationJournal::open(directory.path().join("result-reservations.bin")).unwrap();
+    reservations
+        .reserve(
+            ReservationRecord::new([81; 32], [91; 32], participant_id, 1, 100).unwrap(),
+            before[&participant_id],
+        )
+        .unwrap();
+    finalize_settlement(
+        &mut accounts,
+        &mut reservations,
+        [91; 32],
+        &result,
+        &[[81; 32]],
+    )
+    .unwrap();
+
+    let query = json!({
+        "schema_version": 1,
+        "participant_id": bs58::encode(participant_id).into_string(),
+    });
+    let output = run_client_command(
+        &[
+            "client",
+            "result",
+            "--state",
+            state_path.to_str().unwrap(),
+            "--keypair",
+            keypair_path.to_str().unwrap(),
+        ],
+        &serde_json::to_vec(&query).unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "result failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let settled: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(settled["epoch_id"], bs58::encode([91; 32]).into_string());
+    assert_eq!(settled["base_atoms"], 2);
+    assert_eq!(settled["quote_atoms"], 0);
+
+    let wrong_key_path = directory.path().join("wrong-keypair.json");
+    write_keypair(&wrong_key_path, &Keypair::new_from_array([8; 32]), 0o600);
+    assert!(!run_client_command(
+        &[
+            "client",
+            "result",
+            "--state",
+            state_path.to_str().unwrap(),
+            "--keypair",
+            wrong_key_path.to_str().unwrap(),
+        ],
+        &serde_json::to_vec(&query).unwrap(),
+    )
+    .status
+    .success());
+}
+
+#[test]
+fn bot_epoch_command_returns_the_exact_validated_crowd_terms() {
+    let fixture = fixture();
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "epoch_id": bs58::encode(fixture.epoch_id).into_string(),
+        "base_mint": bs58::encode([31; 32]).into_string(),
+        "quote_mint": bs58::encode([32; 32]).into_string(),
+        "base_lot_atoms": 1,
+        "quote_atoms_per_lot": 100,
+        "minimum_count": 4,
+        "keyper_threshold": 2,
+        "lock_deadline": now + 900,
+        "abort_deadline": now + 1000,
+        "epoch_public_keys_base64": BASE64.encode(&fixture.epoch_public_keys_wire),
+    });
+    let output = run_client_command(&["client", "epoch"], &serde_json::to_vec(&request).unwrap());
+    assert!(
+        output.status.success(),
+        "epoch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response, request);
+
+    let mut unsafe_epoch = request.clone();
+    unsafe_epoch["minimum_count"] = json!(3);
+    assert!(!run_client_command(
+        &["client", "epoch"],
+        &serde_json::to_vec(&unsafe_epoch).unwrap(),
+    )
+    .status
+    .success());
+
+    let mut expired_epoch = request;
+    expired_epoch["lock_deadline"] = json!(now - 2);
+    expired_epoch["abort_deadline"] = json!(now - 1);
+    assert!(!run_client_command(
+        &["client", "epoch"],
+        &serde_json::to_vec(&expired_epoch).unwrap(),
+    )
+    .status
+    .success());
 }

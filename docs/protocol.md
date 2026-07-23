@@ -48,7 +48,7 @@ The encrypted order begins with a fixed 128-byte v1 body containing:
 - a 16-byte client nonce;
 - zero-filled padding.
 
-The trader adds a 64-byte Ed25519 signature before threshold encryption. The separate funded authorization binds the epoch, participant, trading public key, authorization nonce, reserved base and quote amounts, and expiry slot to the operator's signature.
+The trader adds a 64-byte Ed25519 signature before threshold encryption. The reservation journal binds each nonce to one epoch before authorization. The funded authorization then binds that epoch, participant, trading public key, nonce, reserved base and quote amounts, and expiry slot to the operator's signature.
 
 The epoch fixes `base_lot_atoms` and `quote_atoms_per_lot`. A buy is eligible when its limit is at least the epoch price. A sell is eligible when its limit is at most the epoch price. The host ledger applies every valid internal fill and returns one residual:
 
@@ -70,7 +70,20 @@ A positive residual buys base from the venue. A negative residual sells base. Ze
 
 ## Client boundary
 
-The bot-facing command performs the secret-bearing step locally:
+The reference bot flow has four strict JSON commands. One state file belongs to one pool; multi-pool operators must keep separate files:
+
+```text
+account -> epoch -> prepare -> result
+```
+
+- `client account` registers a participant, trading public key, and two-sided balance in a checksum-protected local state file.
+- `client epoch` checks the shape and deadline of the coordinator-supplied epoch ID, mints, price, crowd minimum, 2-of-3 threshold, deadlines, and threshold public key.
+- `client prepare` performs the secret-bearing step locally.
+- `client result` reads a persisted post-settlement balance only when the supplied local trading key matches the registered participant.
+
+Run `kageb client <command> --help` for each exact schema. The local state adapter demonstrates the whole lifecycle; it is not a network service or a remote challenge-response protocol.
+
+The prepare command works as follows:
 
 ```text
 JSON request on stdin -> sign fixed intent -> threshold encrypt -> JSON response on stdout
@@ -114,9 +127,11 @@ The strict v1 request is:
 
 Input is capped at 16 KiB, rejects unknown fields and noncanonical encodings, and must match the authorization's epoch, participant, and trading key. Diagnostics do not echo the request, local path, or key bytes.
 
-The client checks the authorization's structure and context. The coordinator still verifies its operator signature, funding policy, and expiry during admission. The epoch public-key wire has no epoch ID of its own, so v0.1 relies on the coordinator to distribute the correct set for the requested epoch.
+The client checks the authorization's structure and context. The coordinator still verifies its operator signature, funding policy, and expiry during admission. The epoch command does not authenticate the coordinator or keyper set, and the epoch public-key wire has no epoch ID of its own. V0.1 relies on the coordinator to distribute the correct set for the requested epoch; admission remains the authoritative funding and signature gate.
 
-This is one client adapter, not a hosted API. The operator transport, authorization endpoint, submission relay, remote keyper service, and trading venue integration remain outside v0.1.
+After a settled batch, the reference coordinator checks that the result starts from the current stored balances, persists each new balance, and consumes only reservations bound to that epoch. Released, unknown, reused, stale, or partly consumed reservation sets fail before a new result can commit. `ProgramClient` turns a confirmed read of the exact program-owned epoch PDA into a private-field terminal capability only for `Expired` or `Aborted`; release requires that capability and changes the epoch's unused reservations as one durable batch. Release refuses cross-epoch sets, used reservations, and any epoch whose account result already committed. Both settlement and release take the reservation lock before reading or writing the account commit marker. If a process stops between the account and reservation writes, a retry can finish consumption without reopening the settled funds.
+
+This is one local client adapter, not a hosted API. The operator transport, authorization endpoint, submission relay, remote result authentication, keyper service, and trading venue integration remain outside v0.1.
 
 ## Onchain instructions
 
@@ -149,6 +164,8 @@ Abort and expiry change epoch state. They do not transfer or refund tokens.
 The standalone verifier fetches finalized Devnet state, checks transaction order, reconstructs the allowed instructions, checks balance conservation and program identity, rebuilds the recorded source commit in the pinned container, and compares every SBF byte with ProgramData.
 
 The file is content-addressed and tamper-evident. A hash is not a signature. The proof remains scoped to the recorded run and observer model.
+
+`unverified_local_transcript_sha256` is only a self-reported provenance hook for the private local transcript. The public verifier checks that it is a well-formed digest but cannot reconstruct or authenticate the private transcript. No privacy or settlement claim depends on it.
 
 ## Failure and liveness
 

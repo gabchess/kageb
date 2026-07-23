@@ -2,7 +2,7 @@
 
 **Four real orders go in. One group trade comes out. No fake trades.**
 
-KageB is a Solana reference prototype for traders who do not want each order to travel beside their public wallet. A trader encrypts a one-lot buy or sell on their own machine. KageB waits for four funded participants, locks the group, then sends only the net result to the market.
+KageB is a Solana reference prototype for traders who do not want each order to travel beside their public wallet. A trader encrypts a one-lot buy or sell on their own machine. KageB waits for four admitted participant IDs with two-sided funding, locks the group, then sends only the net result to the market.
 
 The public settlement trace shows the group result. It does not show which accepted participant chose buy or sell.
 
@@ -61,8 +61,11 @@ WARNING: synthetic assets only; this prototype is not safe for real funds.
 WAIT: crowd 3/4
 LOCKED: crowd 4/4
 REFUSED: one share
+QUORUM: all 3 two-share paths agree
 SETTLED: one aggregate
+RESULTS: authenticated balances persisted
 BALANCED: zero residual; no venue leg
+EXPIRED: underfilled; reservations released
 ABORTED: invalid reveal; trading key suspended
 OBSERVER: direct 4 orders; KageB 1 aggregate
 It does not prove unique humans, production anonymity, private funding or withdrawal, a trustless exchange, protection from the KageB operator, or safe use with real funds.
@@ -70,7 +73,7 @@ It does not prove unique humans, production anonymity, private funding or withdr
 
 ## Verify the Devnet proof
 
-The public evidence records four funded participants, a 4-of-4 crowd lock, a 2-of-3 keyper quorum, and one aggregate `BUY 2 lots` settlement.
+The public evidence records four two-sided funding events from distinct authorities, a 4-of-4 crowd lock, a 2-of-3 keyper quorum, and one aggregate `BUY 2 lots` settlement. It does not claim those authorities belong to four people.
 
 Full source verification needs Docker and `solana-verify` 0.5.1. KageB builds the cited commit inside the official Solana 4.0.1 verifiable-build image pinned in [`verifiable-build.json`](verifiable-build.json).
 
@@ -115,9 +118,9 @@ The workspace exposes Rust protocol building blocks and a reference implementati
 
 - `kageb-host`, imported as `kageb`, provides intent, threshold-encryption, admission, ledger, lock, keyper, observer, and evidence types.
 - `kageb-program` provides the Solana instructions, program state, PDAs, and v1 wire types.
-- The `kageb client prepare` command is the bot-facing boundary. It accepts strict versioned JSON on standard input, signs and encrypts locally, and emits only an encrypted submission plus public identifiers. See [the protocol guide](docs/protocol.md#client-boundary) for the schema and example.
+- The four `kageb client` commands form the reference bot boundary: `account` registers local funded state, `epoch` checks the shape and deadline of coordinator-supplied crowd terms, `prepare` signs and encrypts locally, and `result` returns a persisted balance only to the registered trading key. Each command accepts strict versioned JSON on standard input. Run any command with `--help` for its exact contract, then see [the protocol guide](docs/protocol.md#client-boundary).
 
-The v0.1 API can change. An operator still needs to provide a funded authorization and epoch public keys, admit submissions, run the keyper set, and submit lock and settlement transactions.
+The v0.1 API can change. These commands share a local reference state file scoped to one pool; an operator must use a separate state file for each pool. They are not a hosted coordinator or remote authentication protocol. An operator still needs to provide a funded authorization and epoch public keys, admit submissions, run the keyper set, and submit lock and settlement transactions.
 
 ## Protocol limits
 
