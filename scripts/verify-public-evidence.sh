@@ -11,7 +11,7 @@ rpc="${KAGEB_DEVNET_RPC:-https://api.devnet.solana.com}"
 cargo_bin="$(resolve_cargo)"
 solana_bin="$(resolve_solana)"
 export PATH="$(dirname "$cargo_bin"):$(dirname "$solana_bin"):$PATH"
-expected_commit="ddd57b8cf2fe2cc4a4374ec96576105860fcb139"
+expected_commit="8b1586b30160850883bb12e5e8a0bbc0fa0f12e4"
 
 if [[ ! -f "$evidence" || -L "$evidence" ]]; then
   echo "a regular evidence file is required" >&2
